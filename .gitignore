@@ -45,3 +45,9 @@ docs/test-reports/
 benchmarks/data/*.json
 !benchmarks/data/.gitkeep
 docs/plans/
+
+# Generated HPC4 workflow state and user-specific cluster profiles
+/.hpc4-domestic/
+/.agents/skills/hpc4-domestic-submit/profiles/active.toml
+/.agents/skills/hpc4-domestic-submit/profiles/hpc4-domestic.*.toml
+!/.agents/skills/hpc4-domestic-submit/profiles/hpc4-domestic.example.toml
