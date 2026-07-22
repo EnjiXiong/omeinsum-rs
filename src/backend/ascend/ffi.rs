@@ -12,6 +12,27 @@ impl Drop for Tensor {
     }
 }
 
+pub(crate) struct IntArray(pub(crate) *mut sys::AclIntArray);
+
+impl IntArray {
+    pub(crate) fn new(values: &[i64], operation: &'static str) -> Result<Self, AscendError> {
+        let raw = unsafe { sys::aclCreateIntArray(values.as_ptr(), values.len() as u64) };
+        (!raw.is_null())
+            .then_some(Self(raw))
+            .ok_or_else(|| AscendError::null(operation))
+    }
+}
+
+impl Drop for IntArray {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = sys::aclDestroyIntArray(self.0);
+            }
+        }
+    }
+}
+
 pub(crate) fn checked_product(
     shape: &[usize],
     operation: &'static str,

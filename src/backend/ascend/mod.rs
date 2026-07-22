@@ -1,6 +1,7 @@
 mod contract;
 mod ffi;
 mod normalize;
+mod permute;
 mod reduce;
 mod runtime;
 mod storage;

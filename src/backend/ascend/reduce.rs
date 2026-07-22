@@ -1,23 +1,11 @@
 use super::{
-    ffi::{checked_product, column_major_strides, tensor},
+    ffi::{checked_product, column_major_strides, tensor, IntArray},
     runtime::Runtime,
     storage::AscendStorage,
     sys, AscendError,
 };
 use crate::backend::contract_plan::materialize_strided;
 use std::{ptr, sync::Arc};
-
-struct IntArray(*mut sys::AclIntArray);
-
-impl Drop for IntArray {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                let _ = sys::aclDestroyIntArray(self.0);
-            }
-        }
-    }
-}
 
 pub(crate) struct ReducedOperand {
     pub(crate) storage: AscendStorage<f32>,
@@ -76,10 +64,7 @@ pub(crate) fn reduce_trace(
     let result = runtime.with_transaction(|runtime| {
         let input_tensor = tensor(input.as_mut_ptr(), &input_shape)?;
         let output_tensor = tensor(output.as_mut_ptr(), &reduced_shape)?;
-        let dims = IntArray(unsafe { sys::aclCreateIntArray(dims.as_ptr(), dims.len() as u64) });
-        if dims.0.is_null() {
-            return Err(AscendError::null("aclCreateIntArray"));
-        }
+        let dims = IntArray::new(&dims, "aclCreateIntArray(reduce)")?;
         let mut workspace_size = 0u64;
         let mut executor = ptr::null_mut();
         let status = unsafe {

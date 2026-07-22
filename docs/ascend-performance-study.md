@@ -143,6 +143,29 @@ The batch-first and permuted cases intentionally force layout handling. Their
 contrast demonstrates that operation count alone is insufficient: whether modes
 are already in the backend's preferred order materially changes the result.
 
+### Device-native layout follow-up
+
+A follow-up implementation replaced the standard backend's host round trip for
+complete dense permutations with ACLNN Permute. Non-dense views retain the host
+fallback. Slurm job `109148` ran the original study binary and the optimized
+binary sequentially on the same allocated node; both used the full profile and
+produced empty application and scheduler stderr files.
+
+| Case | Original Ascend ms | Device-native Ascend ms | Improvement | Device-native CPU speedup |
+|---|---:|---:|---:|---:|
+| Batch first, `B=8`, `N=64` | 0.538457 | 0.222003 | 2.43× | 0.82× |
+| Permuted inputs/output, `N=256` | 0.614048 | 0.194432 | 3.16× | 3.68× |
+
+The target cases retained their prior maximum absolute errors (`2.38e-7` and
+`8.34e-7`, respectively). Canonical batch-last and chain controls were mixed
+within 9.2% of the original binary, while the two paths that previously crossed
+the host boundary improved by 2.4–3.2×. This selectivity argues against general
+node warm-up as the sole explanation, but one paired job is still insufficient
+for a variance estimate. Smoke job `109147` also completed with exit `0:0` and
+the exact-value smoke suite's `Ascend smoke checks passed` marker. The optimized
+study binary SHA-256 was
+`e9715318ee655648a7691c62f1f3675965792d74c5d53dbec76cbea838772b0d`.
+
 ## Accuracy
 
 For each workload, the harness computes a CPU reference before timing and fails
@@ -237,9 +260,10 @@ preserved directly rather than fabricating a runscribe record.
    device 0, so allocation efficiency is 50% for this cluster route.
 4. **Data types:** only `f32` is supported. Scientific workloads requiring `f64`
    or complex arithmetic cannot use this backend today.
-5. **Layout costs:** noncanonical and host-assisted layouts can erase the NPU
-   benefit. Device-native transpose/materialization and better lowering should be
-   optimized before expecting broad einsum speedups.
+5. **Layout costs:** dense standard permutations are now device-native, but the
+   batch-first follow-up remains slower than CPU and non-dense views still use a
+   host fallback. Better lowering and device-native handling of non-dense layouts
+   remain necessary for broad einsum speedups.
 6. **Tropical kernel:** large max-plus GEMM is slower than the sequential CPU.
    Profiling and redesigning its tiling/vectorization is higher priority than
    expanding tropical workload coverage.

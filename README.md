@@ -48,8 +48,9 @@ builds can instead provide a matching generated
 shared library through
 `ASCEND_TROPICAL_KERNEL=/absolute/path/to/libomeinsum_tropical_gemm.so`. Ascend support does not
 silently downcast `f64`, reroute unsupported contractions to the CPU backend, or
-add multi-NPU/HCCL communication. Layout materialization and tropical trace
-pre-reduction are currently host-assisted.
+add multi-NPU/HCCL communication. Dense standard operand/output permutations
+use ACLNN on device; non-dense layouts and tropical trace pre-reduction remain
+host-assisted.
 
 See the [Ascend performance study](docs/ascend-performance-study.md) for accuracy,
 scaling, transfer-cost, batched, layout, and contraction-chain measurements.

@@ -1,13 +1,14 @@
 use super::{
     ffi::{checked_product, tensor},
     normalize::normalize_repeated_labels,
+    permute::materialize,
     reduce::reduce_trace,
     runtime::Runtime,
     storage::AscendStorage,
     sys, AscendError,
 };
 use crate::backend::{
-    contract_plan::{is_identity_materialization, materialize_strided, plan_contraction},
+    contract_plan::{is_identity_materialization, plan_contraction},
     Storage,
 };
 use std::{collections::HashMap, ptr, sync::Arc};
@@ -293,20 +294,12 @@ pub(crate) fn contract(
     let canonical_a = if is_identity_materialization(a.len(), shape_a, strides_a, &a_permutation) {
         None
     } else {
-        let host = a.to_vec()?;
-        Some(AscendStorage::upload(
-            runtime.clone(),
-            &materialize_strided(&host, shape_a, strides_a, &a_permutation),
-        )?)
+        Some(materialize(runtime, a, shape_a, strides_a, &a_permutation)?)
     };
     let canonical_b = if is_identity_materialization(b.len(), shape_b, strides_b, &b_permutation) {
         None
     } else {
-        let host = b.to_vec()?;
-        Some(AscendStorage::upload(
-            runtime.clone(),
-            &materialize_strided(&host, shape_b, strides_b, &b_permutation),
-        )?)
+        Some(materialize(runtime, b, shape_b, strides_b, &b_permutation)?)
     };
     let a = canonical_a.as_ref().unwrap_or(a);
     let b = canonical_b.as_ref().unwrap_or(b);
@@ -328,7 +321,6 @@ pub(crate) fn contract(
     };
     let output = launch(runtime, a, b, output, &a_shape, &b_shape, &c_shape, batched)?;
     if let Some(perm) = plan.output_perm {
-        let host = output.to_vec()?;
         let canonical_shape: Vec<usize> = plan
             .left_modes
             .iter()
@@ -351,8 +343,13 @@ pub(crate) fn contract(
                 current
             })
             .collect();
-        let reordered = materialize_strided(&host, &canonical_shape, &canonical_strides, &perm);
-        return AscendStorage::upload(runtime.clone(), &reordered);
+        return materialize(
+            runtime,
+            &output,
+            &canonical_shape,
+            &canonical_strides,
+            &perm,
+        );
     }
     Ok(output)
 }

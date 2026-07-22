@@ -97,6 +97,19 @@ extern "C" {
         executor: *mut AclOpExecutor,
         stream: AclrtStream,
     ) -> AclnnStatus;
+    pub fn aclnnPermuteGetWorkspaceSize(
+        input: *const AclTensor,
+        dims: *const AclIntArray,
+        output: *mut AclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut AclOpExecutor,
+    ) -> AclnnStatus;
+    pub fn aclnnPermute(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut AclOpExecutor,
+        stream: AclrtStream,
+    ) -> AclnnStatus;
     pub fn aclnnReduceSumGetWorkspaceSize(
         input: *const AclTensor,
         dims: *const AclIntArray,
