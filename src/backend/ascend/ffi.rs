@@ -1,4 +1,5 @@
-use super::{sys, AscendError};
+use super::{runtime::Runtime, sys, AscendError};
+use std::mem::ManuallyDrop;
 
 pub(crate) struct Tensor(pub(crate) *mut sys::AclTensor);
 
@@ -30,6 +31,51 @@ impl Drop for IntArray {
                 let _ = sys::aclDestroyIntArray(self.0);
             }
         }
+    }
+}
+
+/// ACLNN metadata and workspace that must outlive an enqueued stream operation.
+///
+/// Dropping this value intentionally leaks its resources. Call [`Self::release`]
+/// only after the stream has synchronized; leaking is the safe fallback when
+/// stream state is unknown.
+pub(crate) struct PendingOperation {
+    tensors: ManuallyDrop<Vec<Tensor>>,
+    arrays: ManuallyDrop<Vec<IntArray>>,
+    workspace: *mut std::ffi::c_void,
+}
+
+impl PendingOperation {
+    pub(crate) fn new(
+        tensors: Vec<Tensor>,
+        arrays: Vec<IntArray>,
+        workspace: *mut std::ffi::c_void,
+    ) -> Self {
+        Self {
+            tensors: ManuallyDrop::new(tensors),
+            arrays: ManuallyDrop::new(arrays),
+            workspace,
+        }
+    }
+
+    pub(crate) fn release(mut self, _runtime: &Runtime) {
+        if !self.workspace.is_null() {
+            unsafe {
+                let _ = sys::aclrtFree(self.workspace);
+            }
+            self.workspace = std::ptr::null_mut();
+        }
+        unsafe {
+            ManuallyDrop::drop(&mut self.arrays);
+            ManuallyDrop::drop(&mut self.tensors);
+        }
+    }
+}
+
+impl Drop for PendingOperation {
+    fn drop(&mut self) {
+        // The ManuallyDrop fields and raw workspace intentionally remain live.
+        // Only release them explicitly after successful stream synchronization.
     }
 }
 

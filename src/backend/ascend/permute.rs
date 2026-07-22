@@ -1,5 +1,5 @@
 use super::{
-    ffi::{checked_product, tensor, IntArray},
+    ffi::{checked_product, tensor, IntArray, PendingOperation},
     runtime::Runtime,
     storage::AscendStorage,
     sys, AscendError,
@@ -8,13 +8,13 @@ use crate::backend::{contract_plan::materialize_strided, Storage};
 use std::{ptr, sync::Arc};
 
 #[derive(Debug, PartialEq, Eq)]
-struct DensePermutation {
+pub(crate) struct DensePermutation {
     input_shape: Vec<usize>,
     output_shape: Vec<usize>,
     dims: Vec<i64>,
 }
 
-fn dense_permutation(
+pub(crate) fn dense_permutation(
     storage_len: usize,
     shape: &[usize],
     strides: &[usize],
@@ -75,68 +75,66 @@ fn dense_permutation(
     }))
 }
 
+pub(crate) fn enqueue(
+    runtime: &Runtime,
+    source: &AscendStorage<f32>,
+    output: &AscendStorage<f32>,
+    plan: &DensePermutation,
+) -> Result<PendingOperation, AscendError> {
+    let input_tensor = tensor(source.as_mut_ptr(), &plan.input_shape)?;
+    let output_tensor = tensor(output.as_mut_ptr(), &plan.output_shape)?;
+    let dims = IntArray::new(&plan.dims, "aclCreateIntArray(permute)")?;
+    let mut workspace_size = 0u64;
+    let mut executor = ptr::null_mut();
+    let status = unsafe {
+        sys::aclnnPermuteGetWorkspaceSize(
+            input_tensor.0,
+            dims.0,
+            output_tensor.0,
+            &mut workspace_size,
+            &mut executor,
+        )
+    };
+    if status != sys::ACL_SUCCESS {
+        return Err(AscendError::status("aclnnPermuteGetWorkspaceSize", status));
+    }
+    if executor.is_null() {
+        return Err(AscendError::null("aclnnPermuteGetWorkspaceSize executor"));
+    }
+    let bytes = usize::try_from(workspace_size)
+        .map_err(|_| AscendError::status("aclnnPermute workspace overflow", -1))?;
+    let workspace = runtime.alloc_locked(bytes, false)?;
+    let status = unsafe { sys::aclnnPermute(workspace, workspace_size, executor, runtime.stream) };
+    if status != sys::ACL_SUCCESS {
+        if !workspace.is_null() {
+            unsafe {
+                let _ = sys::aclrtFree(workspace);
+            }
+        }
+        return Err(AscendError::status("aclnnPermute", status));
+    }
+    Ok(PendingOperation::new(
+        vec![input_tensor, output_tensor],
+        vec![dims],
+        workspace,
+    ))
+}
+
 fn materialize_dense(
     runtime: &Arc<Runtime>,
     source: &AscendStorage<f32>,
     plan: DensePermutation,
 ) -> Result<AscendStorage<f32>, AscendError> {
     let output = AscendStorage::allocate(runtime.clone(), source.len(), false)?;
-    let mut stream_state_unknown = false;
-    let result = runtime.with_transaction(|runtime| {
-        let input_tensor = tensor(source.as_mut_ptr(), &plan.input_shape)?;
-        let output_tensor = tensor(output.as_mut_ptr(), &plan.output_shape)?;
-        let dims = IntArray::new(&plan.dims, "aclCreateIntArray(permute)")?;
-        let mut workspace_size = 0u64;
-        let mut executor = ptr::null_mut();
-        let status = unsafe {
-            sys::aclnnPermuteGetWorkspaceSize(
-                input_tensor.0,
-                dims.0,
-                output_tensor.0,
-                &mut workspace_size,
-                &mut executor,
-            )
-        };
-        if status != sys::ACL_SUCCESS {
-            return Err(AscendError::status("aclnnPermuteGetWorkspaceSize", status));
-        }
-        if executor.is_null() {
-            return Err(AscendError::null("aclnnPermuteGetWorkspaceSize executor"));
-        }
-        let bytes = usize::try_from(workspace_size)
-            .map_err(|_| AscendError::status("aclnnPermute workspace overflow", -1))?;
-        let workspace = runtime.alloc_locked(bytes, false)?;
-        let status =
-            unsafe { sys::aclnnPermute(workspace, workspace_size, executor, runtime.stream) };
-        if status != sys::ACL_SUCCESS {
-            if !workspace.is_null() {
-                unsafe {
-                    let _ = sys::aclrtFree(workspace);
-                }
-            }
-            return Err(AscendError::status("aclnnPermute", status));
-        }
-        stream_state_unknown = true;
+    runtime.with_transaction(|runtime| {
+        let pending = enqueue(runtime, source, &output, &plan)?;
         if let Err(error) = runtime.synchronize_locked() {
-            std::mem::forget(input_tensor);
-            std::mem::forget(output_tensor);
-            std::mem::forget(dims);
+            drop(pending);
             return Err(error);
         }
-        stream_state_unknown = false;
-        if !workspace.is_null() {
-            unsafe {
-                let _ = sys::aclrtFree(workspace);
-            }
-        }
+        pending.release(runtime);
         Ok(())
-    });
-    if let Err(error) = result {
-        if stream_state_unknown {
-            std::mem::forget(output);
-        }
-        return Err(error);
-    }
+    })?;
     Ok(output)
 }
 

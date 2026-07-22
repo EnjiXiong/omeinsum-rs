@@ -166,6 +166,28 @@ the exact-value smoke suite's `Ascend smoke checks passed` marker. The optimized
 study binary SHA-256 was
 `e9715318ee655648a7691c62f1f3675965792d74c5d53dbec76cbea838772b0d`.
 
+A second follow-up queued dense input permutations, MatMul, and the dense output
+permutation on one ordered ACL stream and synchronized once. Jobs `109158` and
+`109159` compared this fused pipeline against the device-permutation binary in
+opposite execution orders; all application and scheduler stderr files were
+empty.
+
+| Case | Device permutation ms | Fused pipeline ms | Improvement | Fused CPU speedup |
+|---|---:|---:|---:|---:|
+| Batch first, old then fused | 0.221316 | 0.150152 | 1.47× | 1.22× |
+| Batch first, fused then old | 0.233422 | 0.141832 | 1.65× | 1.31× |
+| Permuted, old then fused | 0.178076 | 0.158191 | 1.13× | 4.53× |
+| Permuted, fused then old | 0.196076 | 0.140714 | 1.39× | 5.09× |
+
+The target cases retained maximum absolute errors of `2.38e-7` and `8.34e-7`.
+The canonical batch-last `B=8` control moved in opposite directions across the
+two jobs (0.94× and 1.11×), while batch-first improved in both orders. This
+reduces the likelihood that run order or operator warm-up explains the target
+gain, but two paired jobs still do not provide a population variance estimate.
+Smoke job `109157` completed with exit `0:0`, the exact-value success marker,
+and empty stderr. The fused study binary SHA-256 was
+`b54d6b8ab9179fd4b337a6c2f291fda98a6a21a84dc53cd0fc84baaa33917493`.
+
 ## Accuracy
 
 For each workload, the harness computes a CPU reference before timing and fails
@@ -260,10 +282,10 @@ preserved directly rather than fabricating a runscribe record.
    device 0, so allocation efficiency is 50% for this cluster route.
 4. **Data types:** only `f32` is supported. Scientific workloads requiring `f64`
    or complex arithmetic cannot use this backend today.
-5. **Layout costs:** dense standard permutations are now device-native, but the
-   batch-first follow-up remains slower than CPU and non-dense views still use a
-   host fallback. Better lowering and device-native handling of non-dense layouts
-   remain necessary for broad einsum speedups.
+5. **Layout costs:** dense standard permutations are device-native and fused
+   batch-first execution now beats the paired sequential CPU, but non-dense views
+   still use a host fallback. Better lowering and device-native handling of
+   non-dense layouts remain necessary for broad einsum speedups.
 6. **Tropical kernel:** large max-plus GEMM is slower than the sequential CPU.
    Profiling and redesigning its tiling/vectorization is higher priority than
    expanding tropical workload coverage.
