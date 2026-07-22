@@ -1,5 +1,5 @@
 use super::{
-    ffi::{checked_product, tensor, IntArray, PendingOperation},
+    ffi::{checked_product, finish_operation, tensor, EnqueueAttempt, IntArray, PendingOperation},
     runtime::Runtime,
     storage::AscendStorage,
     sys, AscendError,
@@ -80,7 +80,7 @@ pub(crate) fn enqueue(
     source: &AscendStorage<f32>,
     output: &AscendStorage<f32>,
     plan: &DensePermutation,
-) -> Result<PendingOperation, AscendError> {
+) -> Result<EnqueueAttempt, AscendError> {
     let input_tensor = tensor(source.as_mut_ptr(), &plan.input_shape)?;
     let output_tensor = tensor(output.as_mut_ptr(), &plan.output_shape)?;
     let dims = IntArray::new(&plan.dims, "aclCreateIntArray(permute)")?;
@@ -104,20 +104,12 @@ pub(crate) fn enqueue(
     let bytes = usize::try_from(workspace_size)
         .map_err(|_| AscendError::status("aclnnPermute workspace overflow", -1))?;
     let workspace = runtime.alloc_locked(bytes, false)?;
+    let operation = PendingOperation::new(vec![input_tensor, output_tensor], vec![dims], workspace);
     let status = unsafe { sys::aclnnPermute(workspace, workspace_size, executor, runtime.stream) };
-    if status != sys::ACL_SUCCESS {
-        if !workspace.is_null() {
-            unsafe {
-                let _ = sys::aclrtFree(workspace);
-            }
-        }
-        return Err(AscendError::status("aclnnPermute", status));
-    }
-    Ok(PendingOperation::new(
-        vec![input_tensor, output_tensor],
-        vec![dims],
-        workspace,
-    ))
+    let result = (status == sys::ACL_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| AscendError::status("aclnnPermute", status));
+    Ok(EnqueueAttempt::new(operation, result))
 }
 
 fn materialize_dense(
@@ -127,13 +119,13 @@ fn materialize_dense(
 ) -> Result<AscendStorage<f32>, AscendError> {
     let output = AscendStorage::allocate(runtime.clone(), source.len(), false)?;
     runtime.with_transaction(|runtime| {
-        let pending = enqueue(runtime, source, &output, &plan)?;
-        if let Err(error) = runtime.synchronize_locked() {
-            drop(pending);
-            return Err(error);
-        }
-        pending.release(runtime);
-        Ok(())
+        let (pending, launch_result) = enqueue(runtime, source, &output, &plan)?.into_parts();
+        finish_operation(
+            pending,
+            launch_result,
+            || runtime.synchronize_locked(),
+            |operation| operation.release(runtime),
+        )
     })?;
     Ok(output)
 }

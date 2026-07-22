@@ -79,6 +79,58 @@ impl Drop for PendingOperation {
     }
 }
 
+/// Resources and status from an attempted asynchronous ACLNN launch.
+///
+/// CANN does not guarantee that a failed launch submitted no stream work, so
+/// callers must retain `operation` and synchronize before handling `result`.
+pub(crate) struct EnqueueAttempt {
+    operation: PendingOperation,
+    result: Result<(), AscendError>,
+}
+
+impl EnqueueAttempt {
+    pub(crate) fn new(operation: PendingOperation, result: Result<(), AscendError>) -> Self {
+        Self { operation, result }
+    }
+
+    pub(crate) fn into_parts(self) -> (PendingOperation, Result<(), AscendError>) {
+        (self.operation, self.result)
+    }
+}
+
+pub(crate) fn finish_pending<T>(
+    pending: Vec<T>,
+    enqueue_result: Result<(), AscendError>,
+    synchronize: impl FnOnce() -> Result<(), AscendError>,
+    mut release: impl FnMut(T),
+) -> Result<(), AscendError> {
+    if pending.is_empty() {
+        return enqueue_result;
+    }
+    if let Err(error) = synchronize() {
+        drop(pending);
+        return Err(error);
+    }
+    for operation in pending {
+        release(operation);
+    }
+    enqueue_result
+}
+
+pub(crate) fn finish_operation<T>(
+    operation: T,
+    enqueue_result: Result<(), AscendError>,
+    synchronize: impl FnOnce() -> Result<(), AscendError>,
+    release: impl FnOnce(T),
+) -> Result<(), AscendError> {
+    if let Err(error) = synchronize() {
+        drop(operation);
+        return Err(error);
+    }
+    release(operation);
+    enqueue_result
+}
+
 pub(crate) fn checked_product(
     shape: &[usize],
     operation: &'static str,

@@ -1,5 +1,5 @@
 use super::{
-    ffi::{checked_product, tensor, PendingOperation},
+    ffi::{checked_product, finish_pending, tensor, EnqueueAttempt, PendingOperation},
     normalize::normalize_repeated_labels,
     permute::{dense_permutation, enqueue as enqueue_permutation, materialize, DensePermutation},
     reduce::reduce_trace,
@@ -12,6 +12,8 @@ use crate::backend::{
     Storage,
 };
 use std::{collections::HashMap, ptr, sync::Arc};
+
+const MAX_PIPELINE_OPERATIONS: usize = 4;
 
 pub(crate) fn validate_operand(
     storage_len: usize,
@@ -97,7 +99,7 @@ fn enqueue_matmul(
     b_shape: &[usize],
     c_shape: &[usize],
     batched: bool,
-) -> Result<PendingOperation, AscendError> {
+) -> Result<EnqueueAttempt, AscendError> {
     let ta = tensor(a.as_mut_ptr(), a_shape)?;
     let tb = tensor(b.as_mut_ptr(), b_shape)?;
     let tc = tensor(output.as_mut_ptr(), c_shape)?;
@@ -133,6 +135,7 @@ fn enqueue_matmul(
     let bytes = usize::try_from(workspace_size)
         .map_err(|_| AscendError::status("aclnnMatmul workspace overflow", -1))?;
     let workspace = runtime.alloc_locked(bytes, false)?;
+    let operation = PendingOperation::new(vec![ta, tb, tc], Vec::new(), workspace);
     let status = unsafe {
         if batched {
             sys::aclnnBatchMatMul(workspace, workspace_size, executor, runtime.stream)
@@ -140,17 +143,19 @@ fn enqueue_matmul(
             sys::aclnnMatmul(workspace, workspace_size, executor, runtime.stream)
         }
     };
-    if status != sys::ACL_SUCCESS {
-        if !workspace.is_null() {
-            unsafe { sys::aclrtFree(workspace) };
-        }
-        return Err(AscendError::status("aclnnMatmul", status));
-    }
-    Ok(PendingOperation::new(
-        vec![ta, tb, tc],
-        Vec::new(),
-        workspace,
-    ))
+    let result = (status == sys::ACL_SUCCESS)
+        .then_some(())
+        .ok_or_else(|| AscendError::status("aclnnMatmul", status));
+    Ok(EnqueueAttempt::new(operation, result))
+}
+
+fn record_attempt(
+    pending: &mut Vec<PendingOperation>,
+    attempt: EnqueueAttempt,
+) -> Result<(), AscendError> {
+    let (operation, result) = attempt.into_parts();
+    pending.push(operation);
+    result
 }
 
 fn finish_pipeline(
@@ -158,17 +163,12 @@ fn finish_pipeline(
     pending: Vec<PendingOperation>,
     enqueue_result: Result<(), AscendError>,
 ) -> Result<(), AscendError> {
-    if pending.is_empty() {
-        return enqueue_result;
-    }
-    if let Err(error) = runtime.synchronize_locked() {
-        drop(pending);
-        return Err(error);
-    }
-    for operation in pending {
-        operation.release(runtime);
-    }
-    enqueue_result
+    finish_pending(
+        pending,
+        enqueue_result,
+        || runtime.synchronize_locked(),
+        |operation| operation.release(runtime),
+    )
 }
 
 fn prepare_materialization(
@@ -372,47 +372,61 @@ pub(crate) fn contract(
         .transpose()?;
 
     runtime.with_transaction(|runtime| {
-        let mut pending = Vec::new();
+        // Reserve before the first launch so recording an attempted operation
+        // cannot allocate after asynchronous stream work may have been submitted.
+        let mut pending = Vec::with_capacity(MAX_PIPELINE_OPERATIONS);
         let enqueue_result = (|| {
             if let Some(device_plan) = a_device_plan.as_ref() {
-                pending.push(enqueue_permutation(
-                    runtime,
-                    a,
-                    canonical_a
-                        .as_ref()
-                        .expect("device permutation must have an output"),
-                    device_plan,
-                )?);
+                record_attempt(
+                    &mut pending,
+                    enqueue_permutation(
+                        runtime,
+                        a,
+                        canonical_a
+                            .as_ref()
+                            .expect("device permutation must have an output"),
+                        device_plan,
+                    )?,
+                )?;
             }
             if let Some(device_plan) = b_device_plan.as_ref() {
-                pending.push(enqueue_permutation(
-                    runtime,
-                    b,
-                    canonical_b
-                        .as_ref()
-                        .expect("device permutation must have an output"),
-                    device_plan,
-                )?);
+                record_attempt(
+                    &mut pending,
+                    enqueue_permutation(
+                        runtime,
+                        b,
+                        canonical_b
+                            .as_ref()
+                            .expect("device permutation must have an output"),
+                        device_plan,
+                    )?,
+                )?;
             }
-            pending.push(enqueue_matmul(
-                runtime,
-                matmul_a,
-                matmul_b,
-                &matmul_output,
-                &a_shape,
-                &b_shape,
-                &c_shape,
-                batched,
-            )?);
-            if let Some(device_plan) = output_device_plan.as_ref() {
-                pending.push(enqueue_permutation(
+            record_attempt(
+                &mut pending,
+                enqueue_matmul(
                     runtime,
+                    matmul_a,
+                    matmul_b,
                     &matmul_output,
-                    final_output
-                        .as_ref()
-                        .expect("output permutation must have an output"),
-                    device_plan,
-                )?);
+                    &a_shape,
+                    &b_shape,
+                    &c_shape,
+                    batched,
+                )?,
+            )?;
+            if let Some(device_plan) = output_device_plan.as_ref() {
+                record_attempt(
+                    &mut pending,
+                    enqueue_permutation(
+                        runtime,
+                        &matmul_output,
+                        final_output
+                            .as_ref()
+                            .expect("output permutation must have an output"),
+                        device_plan,
+                    )?,
+                )?;
             }
             Ok(())
         })();
@@ -423,5 +437,79 @@ pub(crate) fn contract(
         Ok(output)
     } else {
         Ok(matmul_output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_launch_is_recorded_before_error_propagates() {
+        let operation = PendingOperation::new(Vec::new(), Vec::new(), ptr::null_mut());
+        let attempt = EnqueueAttempt::new(
+            operation,
+            Err(AscendError::status("injected ACLNN launch failure", -1)),
+        );
+        let mut pending = Vec::with_capacity(1);
+
+        assert!(record_attempt(&mut pending, attempt).is_err());
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn launch_error_synchronizes_and_releases_before_returning() {
+        let launch_error = AscendError::status("injected ACLNN launch failure", -1);
+        let mut synchronized = false;
+        let mut released = Vec::new();
+
+        let result = finish_pending(
+            vec![1, 2],
+            Err(launch_error.clone()),
+            || {
+                synchronized = true;
+                Ok(())
+            },
+            |operation| released.push(operation),
+        );
+
+        assert_eq!(result, Err(launch_error));
+        assert!(synchronized);
+        assert_eq!(released, vec![1, 2]);
+    }
+
+    #[test]
+    fn synchronization_error_retains_pending_resources() {
+        let sync_error = AscendError::status("injected synchronization failure", -1);
+        let mut released = Vec::new();
+
+        let result = finish_pending(
+            vec![1, 2],
+            Err(AscendError::status("injected ACLNN launch failure", -1)),
+            || Err(sync_error.clone()),
+            |operation| released.push(operation),
+        );
+
+        assert_eq!(result, Err(sync_error));
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn standalone_launch_error_synchronizes_before_release() {
+        let launch_error = AscendError::status("injected ACLNN launch failure", -1);
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let result = super::super::ffi::finish_operation(
+            1,
+            Err(launch_error.clone()),
+            || {
+                events.borrow_mut().push("synchronize");
+                Ok(())
+            },
+            |_| events.borrow_mut().push("release"),
+        );
+
+        assert_eq!(result, Err(launch_error));
+        assert_eq!(*events.borrow(), vec!["synchronize", "release"]);
     }
 }
