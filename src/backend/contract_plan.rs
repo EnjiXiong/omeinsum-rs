@@ -167,7 +167,12 @@ pub(crate) fn reduce_trace<A: Algebra>(
 ///
 /// Correctness over speed (the CPU backend keeps its own zero-alloc materializer
 /// for its hot path); used by the CUDA tropical executor to lay operands out.
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 pub(crate) fn materialize_strided<T: Copy + Default>(
     data: &[T],
     shape: &[usize],
@@ -226,7 +231,12 @@ pub(crate) fn gather_contiguous<T: Copy + Default>(
 /// Consumed by the CUDA tropical executor (the CPU backend keeps its own richer
 /// layout plan, and the cuTENSOR `cuda` path lowers via cuTENSOR directly), so it
 /// is compiled only under `cuda-tropical` (and in tests).
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContractionPlan {
     pub batch_modes: Vec<i32>,
@@ -248,7 +258,12 @@ pub(crate) struct ContractionPlan {
     pub output_perm: Option<Vec<usize>>,
 }
 
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 impl ContractionPlan {
     /// Whether the contraction has trace modes that require a pre-reduction.
     ///
@@ -288,7 +303,12 @@ impl ContractionPlan {
 /// Pure index/shape arithmetic — no tensor data is touched. The sizes are read
 /// from whichever operand carries each mode (`modes_a`/`shape_a` for batch, left,
 /// and contracted; `modes_b`/`shape_b` for right).
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 pub(crate) fn plan_contraction(
     modes_a: &[i32],
     shape_a: &[usize],

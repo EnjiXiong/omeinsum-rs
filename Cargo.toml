@@ -74,8 +74,14 @@ cuda = ["dep:cudarc"]
 # and runs without libcutensor present.
 cuda-tropical = ["dep:cudarc", "tropical", "dep:tropical-gemm-cuda"]
 
+# Experimental single-NPU Ascend backend via CANN 8.5 ACL/ACLNN.
+ascend = []
+
+# Fused f32 MaxPlus/MinPlus/MaxMul kernels with u32 argmax tracking.
+ascend-tropical = ["ascend", "tropical"]
+
 # Convenience: all features
-full = ["tropical", "cuda", "cuda-tropical"]
+full = ["tropical", "cuda", "cuda-tropical", "ascend", "ascend-tropical"]
 
 [[example]]
 name = "basic_einsum"
@@ -91,6 +97,11 @@ required-features = ["tropical"]
 name = "tropical_network_gpu"
 path = "examples/tropical_network_gpu.rs"
 required-features = ["cuda-tropical"]
+
+[[example]]
+name = "ascend_smoke"
+path = "examples/ascend_smoke.rs"
+required-features = ["ascend"]
 
 [workspace]
 members = [".", "omeinsum-cli"]

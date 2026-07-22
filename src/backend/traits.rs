@@ -209,3 +209,7 @@ impl BackendScalar<crate::backend::Cuda> for f64 {}
 impl BackendScalar<crate::backend::Cuda> for crate::backend::CudaComplex<f32> {}
 #[cfg(feature = "cuda")]
 impl BackendScalar<crate::backend::Cuda> for crate::backend::CudaComplex<f64> {}
+
+// Milestone A intentionally exposes only CANN's native f32 matmul path.
+#[cfg(any(feature = "ascend", feature = "ascend-tropical"))]
+impl BackendScalar<crate::backend::Ascend> for f32 {}
