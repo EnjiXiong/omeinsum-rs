@@ -114,6 +114,9 @@ where
     let mut grad_b_vec = vec![T::default(); b.numel()];
 
     for (out_linear, &grad_val) in grad_c_vec.iter().enumerate() {
+        if argmax_vec[out_linear] == u32::MAX {
+            continue;
+        }
         let output_coords = linear_to_coords(out_linear, grad_c.shape());
         let winner_coords = linear_to_coords(argmax_vec[out_linear] as usize, &contracted_shape);
 

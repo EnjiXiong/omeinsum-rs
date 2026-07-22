@@ -20,6 +20,40 @@ Einstein summation for tropical and standard tensor networks in Rust. Inspired b
 omeinsum = "0.1"
 ```
 
+### Experimental Ascend NPU backend
+
+The optional single-NPU backend targets CANN 8.5 and currently supports `f32`:
+
+- `ascend`: standard contractions through ACLNN Matmul, BatchMatMul, and ReduceSum.
+- `ascend-tropical`: fused Ascend C MaxPlus, MinPlus, and MaxMul contractions with
+  `u32` first-winner argmax tracking for backward.
+
+```toml
+[dependencies]
+omeinsum = { version = "0.1", features = ["ascend-tropical"] }
+```
+
+Source the CANN environment and point the build at its installation:
+
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann
+cargo run --features ascend-tropical --example ascend_smoke
+```
+
+The tropical build uses CANN's `ascendc_library` tooling. It defaults to the
+Ascend 910 target validated here (`ASCEND_SOC_VERSION=Ascend910_9382`); set that
+variable to the exact SoC version reported by CANN for another processor. Cross
+builds can instead provide a matching generated
+shared library through
+`ASCEND_TROPICAL_KERNEL=/absolute/path/to/libomeinsum_tropical_gemm.so`. Ascend support does not
+silently downcast `f64`, reroute unsupported contractions to the CPU backend, or
+add multi-NPU/HCCL communication. Layout materialization and tropical trace
+pre-reduction are currently host-assisted.
+
+See the [Ascend performance study](docs/ascend-performance-study.md) for accuracy,
+scaling, transfer-cost, batched, layout, and contraction-chain measurements.
+
 ## Quick Start
 
 ```rust

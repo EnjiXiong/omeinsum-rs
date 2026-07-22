@@ -167,7 +167,12 @@ pub(crate) fn reduce_trace<A: Algebra>(
 ///
 /// Correctness over speed (the CPU backend keeps its own zero-alloc materializer
 /// for its hot path); used by the CUDA tropical executor to lay operands out.
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 pub(crate) fn materialize_strided<T: Copy + Default>(
     data: &[T],
     shape: &[usize],
@@ -202,6 +207,32 @@ pub(crate) fn materialize_strided<T: Copy + Default>(
     out
 }
 
+/// Whether materializing this view with `perm` would reproduce the complete
+/// backing storage unchanged.
+///
+/// Backends can use the original device allocation directly in this case,
+/// avoiding a device-to-host materialization followed by a host-to-device
+/// upload. The storage-length check excludes contiguous-looking prefix and
+/// offset views whose backing allocation contains additional elements.
+#[cfg(any(feature = "ascend", feature = "ascend-tropical", test))]
+pub(crate) fn is_identity_materialization(
+    storage_len: usize,
+    shape: &[usize],
+    strides: &[usize],
+    perm: &[usize],
+) -> bool {
+    if perm.iter().copied().ne(0..shape.len()) {
+        return false;
+    }
+    let Some(numel) = shape
+        .iter()
+        .try_fold(1usize, |size, &extent| size.checked_mul(extent))
+    else {
+        return false;
+    };
+    storage_len == numel && strides == compute_contiguous_strides(shape)
+}
+
 /// Gather a (possibly strided) column-major host tensor into a contiguous
 /// column-major buffer in the *same* axis order (the identity permutation).
 #[cfg(any(feature = "cuda-tropical", test))]
@@ -226,7 +257,12 @@ pub(crate) fn gather_contiguous<T: Copy + Default>(
 /// Consumed by the CUDA tropical executor (the CPU backend keeps its own richer
 /// layout plan, and the cuTENSOR `cuda` path lowers via cuTENSOR directly), so it
 /// is compiled only under `cuda-tropical` (and in tests).
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContractionPlan {
     pub batch_modes: Vec<i32>,
@@ -248,7 +284,12 @@ pub(crate) struct ContractionPlan {
     pub output_perm: Option<Vec<usize>>,
 }
 
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 impl ContractionPlan {
     /// Whether the contraction has trace modes that require a pre-reduction.
     ///
@@ -288,7 +329,12 @@ impl ContractionPlan {
 /// Pure index/shape arithmetic — no tensor data is touched. The sizes are read
 /// from whichever operand carries each mode (`modes_a`/`shape_a` for batch, left,
 /// and contracted; `modes_b`/`shape_b` for right).
-#[cfg(any(feature = "cuda-tropical", test))]
+#[cfg(any(
+    feature = "cuda-tropical",
+    feature = "ascend",
+    feature = "ascend-tropical",
+    test
+))]
 pub(crate) fn plan_contraction(
     modes_a: &[i32],
     shape_a: &[usize],
@@ -447,6 +493,14 @@ mod tests {
         // out is shape [3,2] col-major: out[r + 3*c] = data[perm-applied]
         // element (j=r, i=c) -> data[c*1 + r*2]
         assert_eq!(out, vec![0, 2, 4, 1, 3, 5]);
+    }
+
+    #[test]
+    fn identity_materialization_requires_complete_contiguous_storage() {
+        assert!(is_identity_materialization(6, &[2, 3], &[1, 2], &[0, 1]));
+        assert!(!is_identity_materialization(7, &[2, 3], &[1, 2], &[0, 1]));
+        assert!(!is_identity_materialization(6, &[2, 3], &[3, 1], &[0, 1]));
+        assert!(!is_identity_materialization(6, &[2, 3], &[1, 2], &[1, 0]));
     }
 
     #[test]

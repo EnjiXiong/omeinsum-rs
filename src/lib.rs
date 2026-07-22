@@ -78,3 +78,6 @@ pub use algebra::{MaxMul, MaxPlus, MinPlus};
 
 #[cfg(any(feature = "cuda", feature = "cuda-tropical"))]
 pub use backend::Cuda;
+
+#[cfg(any(feature = "ascend", feature = "ascend-tropical"))]
+pub use backend::{Ascend, AscendError, AscendStorage};
