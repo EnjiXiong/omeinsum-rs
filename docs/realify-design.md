@@ -1,8 +1,8 @@
 # Realify: Complex → Real Tensor Network Conversion
 
-**Status:** core implemented (M0–M2), with an M3 benchmark harness, M4 CLI
-support, and an M5 feature-gated Ascend integration test. Performance measurements
-and the remaining stretch work remain future work.
+**Status:** core implemented (M0–M2), with CPU and Ascend benchmark harnesses,
+M4 CLI support, final-only complex recovery, and an M5 feature-gated Ascend test.
+The 2026-07-22 Ascend study establishes correctness and the performance crossover.
 **Goal:** contract complex-valued tensor networks on backends without native complex
 support (today: Ascend, which is f32-only; also CUDA builds without cuTENSOR) by
 mechanically rewriting the network into an equivalent real-valued network, with no
@@ -110,12 +110,11 @@ realification has **no asymptotic overhead**. Whether the generic optimizer and
 backend realize that ideal schedule is a benchmark question; the constant-factor
 risks are:
 
-- an optimizer that *defers* `M`-merges leaves intermediates carrying ≥2 extra dim-2
-  legs (4× data instead of 2×). This is a **cost issue only, never a correctness
-  issue**: omeco keeps every extra label alive until its `M` vertex consumes it (the
-  label appears downstream, so node outputs retain it and
-  `normalize_binary_operand` will not strip it). Greedy cost penalizes deferral, but
-  there is no hard guarantee → benchmark in M3, tree-aligned fallback in M5.
+- a separate rank-3 `M` leaf forces one temporary with two dim-2 legs (4× real data)
+  under the engine's binary contraction trees. This is not merely a poor tree: the
+  first contraction among `A`, `B`, and `M` leaves two Re/Im labels for every possible
+  pair. Removing it requires a fused three-input lowering or specialized kernel, not
+  a different binary tree. This is a **cost issue only, never a correctness issue**.
 - Gauss's trick (3 real multiplications instead of 4) is a possible later fusion; not
   in scope for v1.
 
@@ -214,10 +213,9 @@ Neither should need code changes to *use* the feature — it is a pure omeinsum 
   loss is their informed choice); document this, do not silently downcast.
 - **D8 — Merge topology in v1 is a left-deep chain** of `M` vertices in input order,
   handed to the optimizer as ordinary inputs. Rationale: simplest correct thing;
-  the optimizer can still schedule merges anywhere. If M3 benchmarks show
-  intermediates accumulating multiple dim-2 legs, M5 adds a tree-aligned variant
-  (optimize the *complex* network first, then attach one `M` per binary node joining
-  two complex-carrying subtrees, via `set_contraction_tree`).
+  the optimizer can still schedule merges anywhere. M3 found two Re/Im legs in each
+  measured binary intermediate; §1.4 proves tree alignment alone cannot reduce that
+  count, so a future optimization must fuse multiplication-vertex lowering.
 - **D9 — Output is explicit about whether a trailing Re/Im axis exists** (see
   `RealifiedOutput`), so `m == 0` (all-real network) is not a silent special case.
 
@@ -312,6 +310,11 @@ where
 pub fn split_re_im<T: Scalar, B: Backend>(
     result: &Tensor<T, B>,
 ) -> (Vec<T>, Vec<T>);
+
+/// Final-only recovery with one complex output allocation.
+pub fn recover_complex<T: Scalar, B: Backend>(
+    result: &Tensor<T, B>,
+) -> Vec<Complex<T>>;
 ```
 
 Notes:
@@ -382,21 +385,40 @@ Tests prove **values** (`approx::assert_relative_eq`, tol 1e-10 for f64):
    internally — fine here, since every size (including the dim-2 legs) is inferable
    from the realified tensors; pass the plan's `ixs`/`iy` slices directly.
 
-### M3 — benchmark + docs
+### M3 — benchmark + docs (implemented and measured)
 
 Files: `benches/realify.rs` (new, criterion, mirror `complex_tdvp.rs` cases),
 `Cargo.toml` (`[[bench]]`), this document (update status), `docs/src` book page if
 the mdbook lists features.
 
-- Compare: native `Standard<Complex64>` CPU vs realified `Standard<f64>` CPU on the
-  TDVP shapes. Acceptance: realified within ~1.3× of native complex CPU time (both
-  reduce to faer GEMMs; the gap is permute/fold overhead). Record numbers here.
-- Inspect (debug print or `contraction_tree()`) whether greedy defers M merges on
-  the bench networks. If intermediates carry ≥2 extra legs → schedule M5.
-- Implemented: `benches/realify.rs` mirrors the TDVP cases and registers as the
-  `realify` Criterion bench. Measurements are intentionally not recorded here yet;
-  run the benchmark under the repo's `runscribe` experiment protocol before using
-  numbers for a design decision.
+- `benches/realify.rs` compares native complex CPU and realified CPU. The dedicated
+  `realify_ascend_study` example additionally separates preloaded execution from
+  end-to-end host conversion, H2D, contraction, one D2H, and `recover_complex`.
+- HPC4 job `109227` ran all four TDVP shapes at χ = 32, 64, 128, 256 with five
+  warmups and 50 NPU repetitions. Every result had a genuinely nonzero imaginary
+  component; maximum absolute error versus native c32 CPU was `1.133e-6` (maximum
+  pointwise relative error `1.611e-3`, dominated by near-zero reference entries).
+- Speedup ranges over the four shapes, against native c32 CPU on the same node:
+
+  | χ | preloaded Ascend | end-to-end Ascend |
+  |---:|---:|---:|
+  | 32 | 0.8–1.6× | 0.5–0.9× |
+  | 64 | 5.0–10.8× | 2.3–3.7× |
+  | 128 | 26.1–76.8× | 7.7–11.6× |
+  | 256 | 163.5–424.6× | 16.0–30.3× |
+
+  Thus aggregate conversion, allocation, transfer, and recovery overhead sets the
+  crossover between χ=32 and χ=64; this study does not attribute that delta to one
+  component. CPU comparisons use ten timed repetitions per cell.
+- All 16 optimized trees reported a maximum of two simultaneous Re/Im legs. Per
+  §1.4, a binary-tree rewrite cannot make this one. The next kernel optimization is
+  fused multiplication-vertex lowering; final recovery was separately reduced from
+  two split-output allocations to one additional complex allocation via
+  `recover_complex`.
+- `runscribe` was unavailable locally and remotely. The session therefore preserves
+  exact commands, raw CSV, NPU metadata, stderr, scheduler state, and hashes under
+  `.hpc4-domestic/sessions/20260722T133107Z-realify-ascend-performance/`. Binary
+  SHA-256: `6d86bdeef8dee9193ebae6b71b6f5159327db0ce83a7417429f0b37dbd26b3ce`.
 
 ### M4 — CLI support (implemented)
 
@@ -415,10 +437,9 @@ Files: `omeinsum-cli/src/contract.rs`, `autodiff.rs`, `format.rs`.
 
 ### M5 — stretch (each independent, do only when justified)
 
-- **Tree-aligned merges**: optimize the complex code first, walk the
-  `NestedEinsum`, insert one M per node joining two complex-carrying subtrees,
-  install via `set_contraction_tree`. Guarantees every intermediate carries exactly
-  one dim-2 leg.
+- **Fused multiplication-vertex lowering**: recognize the `A,B,M` realification
+  motif and emit a fused operation that never materializes its two-leg temporary.
+  A custom binary tree cannot provide this guarantee (§1.4).
 - **Gauss 3-mult fusion** at binary-contract level (needs kernel-side work; only if
   profiling shows the 4th GEMM matters).
 - **`R_φ` / phase utilities** and an explicit-opt-in `detect_real` helper.
@@ -460,9 +481,9 @@ Implementation verification on 2026-07-22:
 - `cargo check --features ascend --tests` passed locally.
 - The feature-gated c32 → f32 Ascend integration test passed on two allocated
   Ascend 910 NPUs in HPC4 Slurm job `109214` (exit `0:0`, empty stderr).
+- The full correctness/performance matrix passed in HPC4 job `109227` (exit `0:0`,
+  empty application and scheduler stderr, success marker and matching binary hash).
 - `make check` passed.
-- `cargo bench --bench realify` was not run because benchmark measurements should be
-  logged under the repo's `runscribe` experiment protocol.
 
 ## 8. References
 

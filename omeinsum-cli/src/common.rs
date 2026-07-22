@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 
 use omeinsum::algebra::Scalar;
-use omeinsum::{split_re_im, BackendScalar, Cpu, Einsum, Tensor};
+use omeinsum::{recover_complex, BackendScalar, Cpu, Einsum, Tensor};
 use serde::Serialize;
 
 use crate::format::{
@@ -163,11 +163,11 @@ pub(crate) fn serialize_realified_complex_tensor_data<T>(
 where
     T: Scalar + BackendScalar<Cpu> + Copy,
 {
-    let (re, im) = split_re_im(tensor);
-    let mut data = Vec::with_capacity(re.len() * 2);
-    for (re, im) in re.into_iter().zip(im) {
-        data.push(to_f64(re));
-        data.push(to_f64(im));
+    let complex = recover_complex(tensor);
+    let mut data = Vec::with_capacity(complex.len() * 2);
+    for value in complex {
+        data.push(to_f64(value.re));
+        data.push(to_f64(value.im));
     }
 
     let shape = tensor.shape()[..tensor.ndim() - 1].to_vec();

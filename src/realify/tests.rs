@@ -247,6 +247,20 @@ fn split_re_im_round_trips_realified_data() {
 }
 
 #[test]
+fn recover_complex_reconstructs_only_the_final_output() {
+    let expected = vec![
+        Complex::new(1.0, 2.0),
+        Complex::new(0.0, -1.0),
+        Complex::new(3.0, 0.0),
+        Complex::new(2.0, -1.0),
+    ];
+    let realified = realify_data(&expected, false);
+    let tensor = Tensor::<f64, Cpu>::from_data(&realified, &[2, 2, 2]);
+
+    assert_eq!(recover_complex(&tensor), expected);
+}
+
+#[test]
 fn mul_vertex_tensor_uses_runtime_m_data() {
     let tensor = mul_vertex_tensor::<f32, Cpu>(Cpu);
 

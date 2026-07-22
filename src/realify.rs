@@ -393,6 +393,33 @@ where
     (data[..block_len].to_vec(), data[block_len..].to_vec())
 }
 
+/// Download a tensor with a trailing Re/Im axis and reconstruct complex values.
+///
+/// Unlike [`split_re_im`], this allocates one additional complex output rather than
+/// two separate split-output vectors. Device execution remains real-valued until
+/// this call.
+pub fn recover_complex<T, B>(result: &Tensor<T, B>) -> Vec<Complex<T>>
+where
+    T: Scalar,
+    B: Backend,
+{
+    assert_eq!(
+        result.shape().last().copied(),
+        Some(2),
+        "realified complex result must have trailing dimension 2, got shape {:?}",
+        result.shape()
+    );
+
+    let data = result.to_vec();
+    let block_len = data.len() / 2;
+    data[..block_len]
+        .iter()
+        .copied()
+        .zip(data[block_len..].iter().copied())
+        .map(|(re, im)| Complex::new(re, im))
+        .collect()
+}
+
 fn cast_f64<T: Float>(value: f64) -> T {
     num_traits::cast(value).expect("realify constants are representable as f32/f64")
 }
