@@ -1,7 +1,8 @@
 # Realify: Complex → Real Tensor Network Conversion
 
-**Status:** core implemented (M0–M2), with an M3 benchmark harness and M4 CLI
-support. Performance measurements and stretch work (M5) remain future work.
+**Status:** core implemented (M0–M2), with an M3 benchmark harness, M4 CLI
+support, and an M5 feature-gated Ascend integration test. Performance measurements
+and the remaining stretch work remain future work.
 **Goal:** contract complex-valued tensor networks on backends without native complex
 support (today: Ascend, which is f32-only; also CUDA builds without cuTENSOR) by
 mechanically rewriting the network into an equivalent real-valued network, with no
@@ -422,7 +423,8 @@ Files: `omeinsum-cli/src/contract.rs`, `autodiff.rs`, `format.rs`.
   profiling shows the 4th GEMM matters).
 - **`R_φ` / phase utilities** and an explicit-opt-in `detect_real` helper.
 - **Ascend integration test** behind the `ascend` feature flag, c32 → f32 network,
-  guarded like the CUDA suites.
+  guarded like the CUDA suites. Implemented in `tests/suites/ascend.rs`; it requires
+  a CANN-enabled host with an allocated NPU to link and execute.
 
 ## 6. Correctness invariants (checklist for review)
 
@@ -455,6 +457,9 @@ Implementation verification on 2026-07-22:
 - `cargo check --benches` passed.
 - `cargo test -p omeinsum-cli realify` passed (nine M4 contract/autodiff and
   topology-validation cases).
+- `cargo check --features ascend --tests` passed locally.
+- The feature-gated c32 → f32 Ascend integration test passed on two allocated
+  Ascend 910 NPUs in HPC4 Slurm job `109214` (exit `0:0`, empty stderr).
 - `make check` passed.
 - `cargo bench --bench realify` was not run because benchmark measurements should be
   logged under the repo's `runscribe` experiment protocol.
