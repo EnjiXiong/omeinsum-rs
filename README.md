@@ -51,6 +51,9 @@ silently downcast `f64`, reroute unsupported contractions to the CPU backend, or
 add multi-NPU/HCCL communication. Layout materialization and tropical trace
 pre-reduction are currently host-assisted.
 
+See the [Ascend performance study](docs/ascend-performance-study.md) for accuracy,
+scaling, transfer-cost, batched, layout, and contraction-chain measurements.
+
 ## Quick Start
 
 ```rust

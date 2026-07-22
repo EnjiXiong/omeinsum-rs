@@ -103,6 +103,11 @@ name = "ascend_smoke"
 path = "examples/ascend_smoke.rs"
 required-features = ["ascend"]
 
+[[example]]
+name = "ascend_study"
+path = "examples/ascend_study.rs"
+required-features = ["ascend-tropical"]
+
 [workspace]
 members = [".", "omeinsum-cli"]
 
