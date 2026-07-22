@@ -17,8 +17,9 @@ echo "Configuring SSH access to HPC4 and AutoDL..."
 umask 077
 mkdir -p "$HOME/.ssh/config.d" "$HOME/.ssh/known_hosts.d"
 
-printf '%s\n' "$HPC4_SSH_PRIVATE_KEY" > "$HOME/.ssh/amp_hpc4_ed25519"
-printf '%s\n' "$AUTODL_SSH_PRIVATE_KEY" > "$HOME/.ssh/amp_autodl_ed25519"
+# Keep multiline private keys out of the orb environment: the stored values are base64.
+printf '%s' "$HPC4_SSH_PRIVATE_KEY" | openssl base64 -d -A > "$HOME/.ssh/amp_hpc4_ed25519"
+printf '%s' "$AUTODL_SSH_PRIVATE_KEY" | openssl base64 -d -A > "$HOME/.ssh/amp_autodl_ed25519"
 chmod 600 "$HOME/.ssh/amp_hpc4_ed25519" "$HOME/.ssh/amp_autodl_ed25519"
 
 # Validate that injected values are parseable private keys without printing key material.
