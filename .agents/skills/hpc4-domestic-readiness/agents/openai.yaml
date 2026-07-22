@@ -1,0 +1,4 @@
+interface:
+  display_name: "HPC4 Job Readiness"
+  short_description: "Check HPC4 job completeness before submit"
+  default_prompt: "Use $hpc4-domestic-readiness to check whether my HPC4 job is complete before submission."

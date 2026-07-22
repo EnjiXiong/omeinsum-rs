@@ -1,0 +1,4 @@
+interface:
+  display_name: "HPC4 Domestic Diagnose"
+  short_description: "Classify HPC4 job failures after submit"
+  default_prompt: "Use $hpc4-domestic-diagnose to classify why my HKUST-GZ HPC4 domestic job failed or stalled."

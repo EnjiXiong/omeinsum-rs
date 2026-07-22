@@ -1,0 +1,68 @@
+# Example HKUST-GZ HPC4 domestic profile.
+# Copy to hpc4-domestic.toml, fill user/repo_path_remote, then activate with:
+#   ln -s hpc4-domestic.toml .agents/skills/hpc4-domestic-submit/profiles/active.toml
+
+[identity]
+name = "hkust-gz-hpc4-domestic"
+purpose = "HKUST-GZ HPC4 domestic Kunpeng/Ascend environment"
+maintainer = "HKUST-GZ HPC support / user-managed profile"
+
+[connection]
+repo_path_remote = "/home/<username>/hpc4-workdir"
+
+[connection.ssh]
+alias = "hpc4"
+host = "hpc4login.hpc.hkust-gz.edu.cn"
+user = "<username>"
+identity_file = "~/.ssh/id_ed25519"
+port = 22
+
+[scheduler]
+type = "slurm"
+default_partition = "hpc"
+
+[[partitions]]
+name = "hpc"
+class = "default-cpu"
+cores = 192
+memory = ""
+max_wall = ""
+gpu = ""
+
+[network]
+internet_from_login = true
+internet_from_compute = false
+
+[region]
+region = "mainland_china"
+
+[limits.hard]
+max_walltime = "24:00:00"
+max_nodes = 1
+max_cpus = 192
+max_array_size = 200
+
+[limits.soft]
+warn_walltime = "08:00:00"
+warn_cpus = 64
+unusual_partitions = []
+
+[limits.paths]
+allowed_roots = ["~/scratch", "~/results", "~/hpc4-workdir"]
+
+[[documentation]]
+url = "https://docs.hpc.hkust-gz.edu.cn/docs/hpc4/domestic/"
+documents = ["connection", "quickstart-submit-slurm-job", "quickstart-submit-ai-job", "models-images"]
+
+[[gotchas]]
+symptom = "NPU requested but Slurm only shows the hpc CPU partition"
+cause = "Public HPC4 docs route NPU development through AIStudio/container resources, not generic Slurm NPU allocation"
+fix = "Do not submit NPU jobs through Slurm unless sinfo/scontrol or an administrator profile exposes an NPU partition/QOS/GRES directive"
+
+[commands]
+quota_command = ""
+
+[notes]
+text = """
+Public HPC4 domestic docs observed on 2026-07-08 list Slurm submission for the Kunpeng CPU cluster with partition hpc. NPU resources are described through AIStudio/container job creation. Treat any NPU Slurm route as unconfirmed until probed or supplied by administrators.
+"""

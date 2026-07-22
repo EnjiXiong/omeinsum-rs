@@ -1,0 +1,4 @@
+interface:
+  display_name: "HPC4 Domestic Workflow"
+  short_description: "Route and record HPC4 domestic jobs"
+  default_prompt: "Use $hpc4-domestic-workflow to prepare, submit, and diagnose my HKUST-GZ HPC4 domestic cluster job."

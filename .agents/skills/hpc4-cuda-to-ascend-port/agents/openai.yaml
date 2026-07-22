@@ -1,0 +1,4 @@
+interface:
+  display_name: "HPC4 CUDA to Ascend Port"
+  short_description: "Strict CUDA-to-Ascend code edits"
+  default_prompt: "Use $hpc4-cuda-to-ascend-port to strictly port CUDA-specific code paths to Ascend/NPU."

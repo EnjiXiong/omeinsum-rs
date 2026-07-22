@@ -1,0 +1,4 @@
+interface:
+  display_name: "HPC4 Domestic Submit"
+  short_description: "Route HPC4 jobs to Slurm or AIStudio"
+  default_prompt: "Use $hpc4-domestic-submit to decide whether my HPC4 domestic job should use Slurm or AIStudio/container resources."

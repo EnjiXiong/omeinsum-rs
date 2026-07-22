@@ -1,0 +1,4 @@
+interface:
+  display_name: "HPC4 Ascend Portability"
+  short_description: "Detect CUDA-to-Ascend portability risks"
+  default_prompt: "Use $hpc4-ascend-portability to check whether my code and environment can run on Ascend/Kunpeng."
