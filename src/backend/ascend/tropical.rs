@@ -5,7 +5,9 @@ use super::{
 use crate::{
     algebra::Algebra,
     backend::{
-        contract_plan::{materialize_strided, plan_contraction, reduce_trace},
+        contract_plan::{
+            is_identity_materialization, materialize_strided, plan_contraction, reduce_trace,
+        },
         Storage,
     },
     tensor::compute_contiguous_strides,
@@ -19,8 +21,8 @@ fn u32_size(value: usize, operation: &'static str) -> Result<u32, AscendError> {
 #[allow(clippy::too_many_arguments)]
 fn launch(
     runtime: &Arc<Runtime>,
-    a: AscendStorage<f32>,
-    b: AscendStorage<f32>,
+    a: &AscendStorage<f32>,
+    b: &AscendStorage<f32>,
     output: AscendStorage<f32>,
     argmax: AscendStorage<u32>,
     batch: usize,
@@ -42,10 +44,9 @@ fn launch(
         .ok_or_else(|| AscendError::status("Ascend tropical output overflow", -1))?;
     let mut stream_state_unknown = false;
     let result = runtime.with_transaction(|runtime| {
-        // A single logical worker avoids target-specific sparse AIV core numbering.
-        // Multi-core tiling requires SoC-specific launch metadata.
-        let workers = 1;
-        let block_dim = workers * 2;
+        // CANN's Ascend910_9382 target exposes 50 dense AIV worker indices.
+        let workers = 50;
+        let block_dim = workers;
         let status = unsafe {
             sys::aclrtlaunch_omeinsum_tropical_gemm(
                 block_dim,
@@ -75,8 +76,6 @@ fn launch(
     });
     if let Err(error) = result {
         if stream_state_unknown {
-            std::mem::forget(a);
-            std::mem::forget(b);
             std::mem::forget(output);
             std::mem::forget(argmax);
         }
@@ -147,19 +146,23 @@ pub(crate) fn contract<A: Algebra<Scalar = f32>>(
     }
 
     let probe = plan_contraction(modes_a, shape_a, modes_b, shape_b, modes_c);
-    let identity_a: Vec<usize> = (0..shape_a.len()).collect();
-    let identity_b: Vec<usize> = (0..shape_b.len()).collect();
-    let a_contiguous = materialize_strided(&a.to_vec()?, shape_a, strides_a, &identity_a);
-    let b_contiguous = materialize_strided(&b.to_vec()?, shape_b, strides_b, &identity_b);
     let (a_data, a_shape, a_modes) = if probe.left_trace.is_empty() {
-        (a_contiguous, shape_a.to_vec(), modes_a.to_vec())
+        (None, shape_a.to_vec(), modes_a.to_vec())
     } else {
-        reduce_trace::<A>(&a_contiguous, shape_a, modes_a, &probe.left_trace)
+        let identity: Vec<usize> = (0..shape_a.len()).collect();
+        let contiguous = materialize_strided(&a.to_vec()?, shape_a, strides_a, &identity);
+        let (data, shape, modes) =
+            reduce_trace::<A>(&contiguous, shape_a, modes_a, &probe.left_trace);
+        (Some(data), shape, modes)
     };
     let (b_data, b_shape, b_modes) = if probe.right_trace.is_empty() {
-        (b_contiguous, shape_b.to_vec(), modes_b.to_vec())
+        (None, shape_b.to_vec(), modes_b.to_vec())
     } else {
-        reduce_trace::<A>(&b_contiguous, shape_b, modes_b, &probe.right_trace)
+        let identity: Vec<usize> = (0..shape_b.len()).collect();
+        let contiguous = materialize_strided(&b.to_vec()?, shape_b, strides_b, &identity);
+        let (data, shape, modes) =
+            reduce_trace::<A>(&contiguous, shape_b, modes_b, &probe.right_trace);
+        (Some(data), shape, modes)
     };
     let plan = plan_contraction(&a_modes, &a_shape, &b_modes, &b_shape, modes_c);
     let zero_contract_extent = plan.contracted_modes.iter().any(|contracted| {
@@ -172,24 +175,46 @@ pub(crate) fn contract<A: Algebra<Scalar = f32>>(
             AscendStorage::upload(runtime.clone(), &vec![u32::MAX; output_len])?,
         ));
     }
-    let a_canonical = materialize_strided(
-        &a_data,
-        &a_shape,
-        &compute_contiguous_strides(&a_shape),
-        &plan.a_permutation(&a_modes),
-    );
-    let b_canonical = materialize_strided(
-        &b_data,
-        &b_shape,
-        &compute_contiguous_strides(&b_shape),
-        &plan.b_permutation(&b_modes),
-    );
+    let a_permutation = plan.a_permutation(&a_modes);
+    let b_permutation = plan.b_permutation(&b_modes);
+    let direct_a = probe.left_trace.is_empty()
+        && is_identity_materialization(a.len(), shape_a, strides_a, &a_permutation);
+    let direct_b = probe.right_trace.is_empty()
+        && is_identity_materialization(b.len(), shape_b, strides_b, &b_permutation);
+    let a_canonical = (!direct_a).then(|| {
+        let source;
+        let (data, strides) = if let Some(data) = a_data.as_ref() {
+            (data.as_slice(), compute_contiguous_strides(&a_shape))
+        } else {
+            source = a.to_vec()?;
+            (source.as_slice(), strides_a.to_vec())
+        };
+        AscendStorage::upload(
+            runtime.clone(),
+            &materialize_strided(data, &a_shape, &strides, &a_permutation),
+        )
+    });
+    let a_canonical = a_canonical.transpose()?;
+    let b_canonical = (!direct_b).then(|| {
+        let source;
+        let (data, strides) = if let Some(data) = b_data.as_ref() {
+            (data.as_slice(), compute_contiguous_strides(&b_shape))
+        } else {
+            source = b.to_vec()?;
+            (source.as_slice(), strides_b.to_vec())
+        };
+        AscendStorage::upload(
+            runtime.clone(),
+            &materialize_strided(data, &b_shape, &strides, &b_permutation),
+        )
+    });
+    let b_canonical = b_canonical.transpose()?;
     let output = AscendStorage::allocate(runtime.clone(), output_len, false)?;
     let argmax = AscendStorage::allocate(runtime.clone(), output_len, false)?;
     let result = launch(
         runtime,
-        AscendStorage::upload(runtime.clone(), &a_canonical)?,
-        AscendStorage::upload(runtime.clone(), &b_canonical)?,
+        a_canonical.as_ref().unwrap_or(a),
+        b_canonical.as_ref().unwrap_or(b),
         output,
         argmax,
         plan.batch_size.max(1),

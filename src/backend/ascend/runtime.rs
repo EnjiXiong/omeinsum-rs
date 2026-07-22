@@ -2,7 +2,10 @@ use super::sys;
 use std::{
     ffi::c_void,
     fmt, ptr,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +53,7 @@ pub(crate) struct Runtime {
     pub(crate) stream: sys::AclrtStream,
     pub(crate) device: i32,
     transaction: Mutex<()>,
+    stream_failed: AtomicBool,
 }
 
 unsafe impl Send for Runtime {}
@@ -85,6 +89,7 @@ impl Runtime {
             stream,
             device,
             transaction: Mutex::new(()),
+            stream_failed: AtomicBool::new(false),
         })
     }
 
@@ -101,6 +106,12 @@ impl Runtime {
         operation: impl FnOnce(&Self) -> Result<T, AscendError>,
     ) -> Result<T, AscendError> {
         let _guard = self.transaction.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stream_failed.load(Ordering::Acquire) {
+            return Err(AscendError::status(
+                "runtime unavailable after stream synchronization failure",
+                -1,
+            ));
+        }
         check("aclrtSetCurrentContext", unsafe {
             sys::aclrtSetCurrentContext(self.context)
         })?;
@@ -108,9 +119,20 @@ impl Runtime {
     }
 
     pub(crate) fn synchronize_locked(&self) -> Result<(), AscendError> {
-        check("aclrtSynchronizeStream", unsafe {
+        let result = check("aclrtSynchronizeStream", unsafe {
             sys::aclrtSynchronizeStream(self.stream)
-        })
+        });
+        if result.is_err() {
+            // The stream may still reference any submitted allocation. Poison
+            // the runtime so storage drops leak those pointers until context
+            // teardown rather than freeing memory that could still be in use.
+            self.stream_failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    pub(crate) fn has_failed_stream(&self) -> bool {
+        self.stream_failed.load(Ordering::Acquire)
     }
 
     pub(crate) fn alloc_locked(

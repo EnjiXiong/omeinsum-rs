@@ -7,7 +7,7 @@ use super::{
     sys, AscendError,
 };
 use crate::backend::{
-    contract_plan::{materialize_strided, plan_contraction},
+    contract_plan::{is_identity_materialization, materialize_strided, plan_contraction},
     Storage,
 };
 use std::{collections::HashMap, ptr, sync::Arc};
@@ -89,8 +89,8 @@ pub(crate) fn validate_metadata(
 #[allow(clippy::too_many_arguments)]
 fn launch(
     runtime: &Arc<Runtime>,
-    a: AscendStorage<f32>,
-    b: AscendStorage<f32>,
+    a: &AscendStorage<f32>,
+    b: &AscendStorage<f32>,
     output: AscendStorage<f32>,
     a_shape: &[usize],
     b_shape: &[usize],
@@ -165,8 +165,6 @@ fn launch(
     });
     if let Err(error) = result {
         if stream_state_unknown {
-            std::mem::forget(a);
-            std::mem::forget(b);
             std::mem::forget(output);
         }
         return Err(error);
@@ -290,14 +288,28 @@ pub(crate) fn contract(
         return AscendStorage::allocate(runtime.clone(), output_len.max(1), true);
     }
 
-    let host_a = a.to_vec()?;
-    let host_b = b.to_vec()?;
-    let canonical_a =
-        materialize_strided(&host_a, shape_a, strides_a, &plan.a_permutation(modes_a));
-    let canonical_b =
-        materialize_strided(&host_b, shape_b, strides_b, &plan.b_permutation(modes_b));
-    let a = AscendStorage::upload(runtime.clone(), &canonical_a)?;
-    let b = AscendStorage::upload(runtime.clone(), &canonical_b)?;
+    let a_permutation = plan.a_permutation(modes_a);
+    let b_permutation = plan.b_permutation(modes_b);
+    let canonical_a = if is_identity_materialization(a.len(), shape_a, strides_a, &a_permutation) {
+        None
+    } else {
+        let host = a.to_vec()?;
+        Some(AscendStorage::upload(
+            runtime.clone(),
+            &materialize_strided(&host, shape_a, strides_a, &a_permutation),
+        )?)
+    };
+    let canonical_b = if is_identity_materialization(b.len(), shape_b, strides_b, &b_permutation) {
+        None
+    } else {
+        let host = b.to_vec()?;
+        Some(AscendStorage::upload(
+            runtime.clone(),
+            &materialize_strided(&host, shape_b, strides_b, &b_permutation),
+        )?)
+    };
+    let a = canonical_a.as_ref().unwrap_or(a);
+    let b = canonical_b.as_ref().unwrap_or(b);
     let output = AscendStorage::allocate(runtime.clone(), output_len.max(1), false)?;
     let (a_shape, b_shape, c_shape, batched) = if plan.batch_size > 1 {
         (

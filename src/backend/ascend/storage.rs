@@ -86,7 +86,7 @@ impl<T: Scalar> AscendStorage<T> {
 
 impl<T: Scalar> Drop for AscendStorage<T> {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if !self.ptr.is_null() && !self.runtime.has_failed_stream() {
             let ptr = self.ptr;
             let _ = self.runtime.with_transaction(|_| {
                 unsafe { sys::aclrtFree(ptr) };

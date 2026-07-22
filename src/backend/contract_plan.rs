@@ -207,6 +207,32 @@ pub(crate) fn materialize_strided<T: Copy + Default>(
     out
 }
 
+/// Whether materializing this view with `perm` would reproduce the complete
+/// backing storage unchanged.
+///
+/// Backends can use the original device allocation directly in this case,
+/// avoiding a device-to-host materialization followed by a host-to-device
+/// upload. The storage-length check excludes contiguous-looking prefix and
+/// offset views whose backing allocation contains additional elements.
+#[cfg(any(feature = "ascend", feature = "ascend-tropical", test))]
+pub(crate) fn is_identity_materialization(
+    storage_len: usize,
+    shape: &[usize],
+    strides: &[usize],
+    perm: &[usize],
+) -> bool {
+    if perm.iter().copied().ne(0..shape.len()) {
+        return false;
+    }
+    let Some(numel) = shape
+        .iter()
+        .try_fold(1usize, |size, &extent| size.checked_mul(extent))
+    else {
+        return false;
+    };
+    storage_len == numel && strides == compute_contiguous_strides(shape)
+}
+
 /// Gather a (possibly strided) column-major host tensor into a contiguous
 /// column-major buffer in the *same* axis order (the identity permutation).
 #[cfg(any(feature = "cuda-tropical", test))]
@@ -467,6 +493,14 @@ mod tests {
         // out is shape [3,2] col-major: out[r + 3*c] = data[perm-applied]
         // element (j=r, i=c) -> data[c*1 + r*2]
         assert_eq!(out, vec![0, 2, 4, 1, 3, 5]);
+    }
+
+    #[test]
+    fn identity_materialization_requires_complete_contiguous_storage() {
+        assert!(is_identity_materialization(6, &[2, 3], &[1, 2], &[0, 1]));
+        assert!(!is_identity_materialization(7, &[2, 3], &[1, 2], &[0, 1]));
+        assert!(!is_identity_materialization(6, &[2, 3], &[3, 1], &[0, 1]));
+        assert!(!is_identity_materialization(6, &[2, 3], &[1, 2], &[1, 0]));
     }
 
     #[test]
