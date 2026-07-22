@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+required_vars=(
+  HPC4_SSH_PRIVATE_KEY HPC4_SSH_HOST HPC4_SSH_PORT HPC4_SSH_USER
+  AUTODL_SSH_PRIVATE_KEY AUTODL_SSH_HOST AUTODL_SSH_PORT AUTODL_SSH_USER
+)
+
+for name in "${required_vars[@]}"; do
+  if [[ -z "${!name:-}" ]]; then
+    printf 'Missing required personal orb secret or environment variable: %s\n' "$name" >&2
+    exit 1
+  fi
+done
+
+echo "Configuring SSH access to HPC4 and AutoDL..."
+umask 077
+mkdir -p "$HOME/.ssh/config.d" "$HOME/.ssh/known_hosts.d"
+
+printf '%s\n' "$HPC4_SSH_PRIVATE_KEY" > "$HOME/.ssh/amp_hpc4_ed25519"
+printf '%s\n' "$AUTODL_SSH_PRIVATE_KEY" > "$HOME/.ssh/amp_autodl_ed25519"
+chmod 600 "$HOME/.ssh/amp_hpc4_ed25519" "$HOME/.ssh/amp_autodl_ed25519"
+
+# Validate that injected values are parseable private keys without printing key material.
+ssh-keygen -y -f "$HOME/.ssh/amp_hpc4_ed25519" >/dev/null
+ssh-keygen -y -f "$HOME/.ssh/amp_autodl_ed25519" >/dev/null
+
+cat > "$HOME/.ssh/config.d/omeinsum-remotes" <<EOF
+Host hpc4
+  HostName $HPC4_SSH_HOST
+  Port $HPC4_SSH_PORT
+  User $HPC4_SSH_USER
+  IdentityFile ~/.ssh/amp_hpc4_ed25519
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile ~/.ssh/known_hosts.d/omeinsum-remotes
+
+Host autodl
+  HostName $AUTODL_SSH_HOST
+  Port $AUTODL_SSH_PORT
+  User $AUTODL_SSH_USER
+  IdentityFile ~/.ssh/amp_autodl_ed25519
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile ~/.ssh/known_hosts.d/omeinsum-remotes
+EOF
+
+config="$HOME/.ssh/config"
+include='Include ~/.ssh/config.d/omeinsum-remotes'
+if ! grep -Fqx "$include" "$config" 2>/dev/null; then
+  temporary="$(mktemp)"
+  printf '%s\n' "$include" > "$temporary"
+  [[ ! -f "$config" ]] || cat "$config" >> "$temporary"
+  mv "$temporary" "$config"
+fi
+chmod 600 "$config" "$HOME/.ssh/config.d/omeinsum-remotes"
+
+# These host keys were verified through the existing trusted local connections.
+cat > "$HOME/.ssh/known_hosts.d/omeinsum-remotes" <<EOF
+$HPC4_SSH_HOST ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAmMdGilzhDdUbAAqK0swNOpsWyybq1RdpaHy5/2S7Rc
+[$AUTODL_SSH_HOST]:$AUTODL_SSH_PORT ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK3kwiFvUVgx1wVKa/LqYm6JNHZqht3d+OSpVJVG/AWa
+EOF
+chmod 600 "$HOME/.ssh/known_hosts.d/omeinsum-remotes"
+
+echo "SSH aliases hpc4 and autodl are configured with pinned host keys."
