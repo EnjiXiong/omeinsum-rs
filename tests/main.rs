@@ -20,6 +20,8 @@ mod integration;
 mod omeinsum_compat;
 #[path = "suites/optimizer.rs"]
 mod optimizer;
+#[path = "suites/realify.rs"]
+mod realify;
 #[path = "suites/showcase.rs"]
 mod showcase;
 #[cfg(feature = "tropical")]

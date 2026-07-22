@@ -223,6 +223,9 @@ where
     let argmax_data = argmax.to_vec();
 
     for (out_idx, &winner_pos) in argmax_data.iter().enumerate() {
+        if winner_pos == u32::MAX {
+            continue;
+        }
         let grad_val = grad_y_data[out_idx];
         // For tropical, each output maps to exactly one winner, but multiple
         // outputs can share the same winner (e.g., in broadcasting).
@@ -974,6 +977,24 @@ mod tests {
         assert_eq!(grad_a.to_vec(), vec![0.0, 1.0]);
         assert_eq!(grad_b.shape(), &[2]);
         assert_eq!(grad_b.to_vec(), vec![0.0, 1.0]);
+    }
+
+    #[cfg(feature = "tropical")]
+    #[test]
+    fn test_tropical_unary_empty_reduction_has_no_gradient_winner() {
+        let input = Tensor::<f32, Cpu>::from_data(&[], &[0]);
+        let size_dict: HashMap<usize, usize> = [(0, 0)].into();
+        let (result, argmax) =
+            execute_unary_with_argmax::<MaxPlus<f32>, f32, Cpu>(&input, &[0], &[], &size_dict);
+
+        assert_eq!(result.shape(), &[] as &[usize]);
+        assert_eq!(result.to_vec(), vec![f32::MIN]);
+        assert_eq!(argmax.to_vec(), vec![u32::MAX]);
+
+        let grad_output = Tensor::<f32, Cpu>::from_data(&[1.0], &[]);
+        let gradient = tropical_unary_backward(&grad_output, &argmax, &[0]);
+        assert_eq!(gradient.shape(), &[0]);
+        assert!(gradient.to_vec().is_empty());
     }
 
     // Test only with tropical feature, not tropical-kernels, because the optimized

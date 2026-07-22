@@ -6,6 +6,8 @@ mod contract;
 mod format;
 mod optimize;
 mod parse;
+mod realify;
+mod topology;
 
 #[derive(Parser)]
 #[command(name = "omeinsum", version, about = "Einstein summation CLI")]
@@ -88,6 +90,10 @@ enum Commands {
         #[arg(long)]
         expr: Option<String>,
 
+        /// Rewrite c32/c64 inputs as a real network before execution
+        #[arg(long)]
+        realify: bool,
+
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
@@ -108,6 +114,10 @@ enum Commands {
         /// Parenthesized einsum expression with explicit contraction order
         #[arg(long)]
         expr: Option<String>,
+
+        /// Rewrite c32/c64 inputs as a real network before differentiation
+        #[arg(long)]
+        realify: bool,
 
         /// Gradient seed for the einsum output, using the Result JSON schema
         #[arg(long = "grad-output")]
@@ -163,12 +173,14 @@ fn main() {
             tensors,
             topology,
             expr,
+            realify,
             output,
             pretty,
         } => contract::run(
             &tensors,
             topology.as_deref(),
             expr.as_deref(),
+            realify,
             output.as_deref(),
             pretty,
         ),
@@ -176,6 +188,7 @@ fn main() {
             tensors,
             topology,
             expr,
+            realify,
             grad_output,
             output,
             pretty,
@@ -183,6 +196,7 @@ fn main() {
             &tensors,
             topology.as_deref(),
             expr.as_deref(),
+            realify,
             grad_output.as_deref(),
             output.as_deref(),
             pretty,

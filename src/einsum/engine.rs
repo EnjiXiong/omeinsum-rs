@@ -1078,11 +1078,11 @@ where
 
     // 2. Build output shape
     let out_shape: Vec<usize> = outer.iter().map(|&idx| size_dict[&idx]).collect();
-    let out_size = out_shape.iter().product::<usize>().max(1);
+    let out_size = out_shape.iter().product::<usize>();
 
     // 3. Build inner ranges (dimensions to sum over)
     let inner_ranges: Vec<usize> = inner_vec.iter().map(|&idx| size_dict[&idx]).collect();
-    let inner_size = inner_ranges.iter().product::<usize>().max(1);
+    let inner_size = inner_ranges.iter().product::<usize>();
 
     // 4. Allocate output
     let mut out_data = vec![A::zero().to_scalar(); out_size];
@@ -1164,15 +1164,15 @@ where
 
     // 2. Build output shape
     let out_shape: Vec<usize> = outer.iter().map(|&idx| size_dict[&idx]).collect();
-    let out_size = out_shape.iter().product::<usize>().max(1);
+    let out_size = out_shape.iter().product::<usize>();
 
     // 3. Build inner ranges
     let inner_ranges: Vec<usize> = inner_vec.iter().map(|&idx| size_dict[&idx]).collect();
-    let inner_size = inner_ranges.iter().product::<usize>().max(1);
+    let inner_size = inner_ranges.iter().product::<usize>();
 
     // 4. Allocate output and argmax
     let mut out_data = vec![A::zero().to_scalar(); out_size];
-    let mut argmax_data = vec![0u32; out_size];
+    let mut argmax_data = vec![u32::MAX; out_size];
 
     // 5. Loop over output positions
     for out_linear in 0..out_size {
@@ -1199,7 +1199,7 @@ where
 
         // 6. Find max over inner indices (tropical-style)
         let mut best_val = A::zero();
-        let mut best_in_pos = 0usize;
+        let mut best_in_pos = u32::MAX;
 
         for inner_linear in 0..inner_size {
             let inner_multi = linear_to_multi(inner_linear, &inner_ranges);
@@ -1213,12 +1213,12 @@ where
             // For first iteration or if this value is better
             if inner_linear == 0 || A::is_better(&val, &best_val) {
                 best_val = val;
-                best_in_pos = in_pos;
+                best_in_pos = in_pos as u32;
             }
         }
 
         out_data[out_linear] = best_val.to_scalar();
-        argmax_data[out_linear] = best_in_pos as u32;
+        argmax_data[out_linear] = best_in_pos;
     }
 
     let result = Tensor::from_data_with_backend(&out_data, &out_shape, tensor.backend().clone());
@@ -1650,6 +1650,28 @@ mod tests {
         // After transpose: [[1, 2], [3, 4]] in column-major = [1, 3, 2, 4]
         assert_eq!(result.shape(), &[2, 2]);
         assert_eq!(result.to_vec(), vec![1.0, 3.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn test_unary_naive_preserves_zero_sized_output_axis() {
+        let input = Tensor::<f32, Cpu>::from_data(&[], &[0]);
+        let size_dict: HashMap<usize, usize> = [(0, 0)].into();
+
+        let result = execute_unary_naive::<Standard<f32>, f32, Cpu>(&input, &[0], &[0], &size_dict);
+
+        assert_eq!(result.shape(), &[0]);
+        assert!(result.to_vec().is_empty());
+    }
+
+    #[test]
+    fn test_unary_naive_empty_reduction_returns_zero() {
+        let input = Tensor::<f32, Cpu>::from_data(&[], &[0]);
+        let size_dict: HashMap<usize, usize> = [(0, 0)].into();
+
+        let result = execute_unary_naive::<Standard<f32>, f32, Cpu>(&input, &[0], &[], &size_dict);
+
+        assert_eq!(result.shape(), &[] as &[usize]);
+        assert_eq!(result.to_vec(), vec![0.0]);
     }
 
     #[test]

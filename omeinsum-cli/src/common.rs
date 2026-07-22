@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 
-use omeco::NestedEinsum;
 use omeinsum::algebra::Scalar;
-use omeinsum::{BackendScalar, Cpu, Einsum, Tensor};
+use omeinsum::{split_re_im, BackendScalar, Cpu, Einsum, Tensor};
 use serde::Serialize;
 
 use crate::format::{
@@ -11,6 +10,7 @@ use crate::format::{
     TensorsFile, TopologyFile,
 };
 use crate::parse::{parse_flat, parse_parenthesized};
+use crate::topology::{validate_labels, validate_tensor_dimensions, validate_tree};
 
 pub(crate) fn validate_execution_source(
     topology_path: Option<&str>,
@@ -155,6 +155,29 @@ where
     }
 }
 
+pub(crate) fn serialize_realified_complex_tensor_data<T>(
+    tensor: &Tensor<T, Cpu>,
+    order: StorageOrder,
+    to_f64: fn(T) -> f64,
+) -> TensorDataFile
+where
+    T: Scalar + BackendScalar<Cpu> + Copy,
+{
+    let (re, im) = split_re_im(tensor);
+    let mut data = Vec::with_capacity(re.len() * 2);
+    for (re, im) in re.into_iter().zip(im) {
+        data.push(to_f64(re));
+        data.push(to_f64(im));
+    }
+
+    let shape = tensor.shape()[..tensor.ndim() - 1].to_vec();
+    if order == StorageOrder::RowMajor {
+        data = col_to_row_major_interleaved(&data, &shape);
+    }
+
+    TensorDataFile { shape, data }
+}
+
 pub(crate) fn build_explicit_einsum<T>(
     tensors: &[&Tensor<T, Cpu>],
     topology_path: Option<&str>,
@@ -253,7 +276,6 @@ where
                 .map_err(|_| format!("Invalid size_dict key '{key}'"))
         })
         .collect::<Result<_, _>>()?;
-    validate_topology_tree(&topology.tree, tensors.len(), &size_dict)?;
 
     let parsed = parse_flat(&topology.expression)?;
     if tensors.len() != parsed.ixs.len() {
@@ -263,7 +285,17 @@ where
             tensors.len()
         ));
     }
-    validate_size_dict_labels(&parsed.ixs, &parsed.iy, &size_dict)?;
+    validate_labels(&parsed.ixs, &parsed.iy, &size_dict)?;
+    validate_tensor_dimensions(tensors, &parsed.ixs, &size_dict)?;
+    let mut leaf_counts = vec![0usize; tensors.len()];
+    validate_tree(&topology.tree, tensors.len(), &size_dict, &mut leaf_counts)?;
+    for (tensor_index, count) in leaf_counts.into_iter().enumerate() {
+        if count != 1 {
+            return Err(format!(
+                "Topology must reference tensor {tensor_index} exactly once, found {count} leaves"
+            ));
+        }
+    }
 
     let mut ein = Einsum::new(parsed.ixs, parsed.iy, size_dict);
     ein.set_contraction_tree(topology.tree);
@@ -326,60 +358,6 @@ fn validate_shape(data: &[f64], shape: &[usize], is_complex: bool) -> Result<(),
         ));
     }
     Ok(())
-}
-
-fn validate_size_dict_labels(
-    ixs: &[Vec<usize>],
-    iy: &[usize],
-    size_dict: &HashMap<usize, usize>,
-) -> Result<(), String> {
-    for &label in ixs.iter().flatten().chain(iy.iter()) {
-        if !size_dict.contains_key(&label) {
-            return Err(format!(
-                "Missing size for label index {} referenced by topology expression",
-                label
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_topology_tree(
-    tree: &NestedEinsum<usize>,
-    num_tensors: usize,
-    size_dict: &HashMap<usize, usize>,
-) -> Result<(), String> {
-    match tree {
-        NestedEinsum::Leaf { tensor_index } => {
-            if *tensor_index >= num_tensors {
-                return Err(format!(
-                    "Topology leaf tensor_index {} out of range for {} tensors",
-                    tensor_index, num_tensors
-                ));
-            }
-            Ok(())
-        }
-        NestedEinsum::Node { args, eins } => {
-            if args.len() != 2 {
-                return Err(format!(
-                    "Topology tree must be binary, found node with {} children",
-                    args.len()
-                ));
-            }
-
-            for label in eins.ixs.iter().flatten().chain(eins.iy.iter()) {
-                if !size_dict.contains_key(label) {
-                    return Err(format!("Topology references unknown label index {}", label));
-                }
-            }
-
-            for arg in args {
-                validate_topology_tree(arg, num_tensors, size_dict)?;
-            }
-            Ok(())
-        }
-    }
 }
 
 fn interleaved_to_complex<T>(data: &[f64], make_complex: fn(f64, f64) -> T) -> Vec<T> {

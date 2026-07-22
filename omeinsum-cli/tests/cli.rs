@@ -15,6 +15,9 @@ fn write_temp_json(content: &str) -> NamedTempFile {
     file
 }
 
+#[path = "cli/realify.rs"]
+mod realify;
+
 #[test]
 fn test_optimize_matmul() {
     cmd()

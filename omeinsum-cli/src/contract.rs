@@ -1,22 +1,29 @@
 use num_complex::{Complex32, Complex64};
-use omeinsum::algebra::Standard;
+use omeinsum::algebra::{Scalar, Standard};
 use omeinsum::{Algebra, BackendScalar, Cpu, Tensor};
 
 use crate::common::{
     build_explicit_einsum, load_complex_tensors, load_real_tensors, read_tensors_file,
-    serialize_complex_tensor_data, serialize_real_tensor_data, write_json_output,
+    serialize_complex_tensor_data, serialize_real_tensor_data,
+    serialize_realified_complex_tensor_data, write_json_output,
 };
 use crate::format::{Dtype, ResultFile, TensorsFile};
+use crate::realify::prepare;
 
 /// Run the contract subcommand.
 pub fn run(
     tensors_path: &str,
     topology_path: Option<&str>,
     expr: Option<&str>,
+    realify: bool,
     output: Option<&str>,
     pretty: Option<bool>,
 ) -> Result<(), String> {
     let tensors_file = read_tensors_file(tensors_path)?;
+
+    if realify && matches!(tensors_file.dtype, Dtype::F32 | Dtype::F64) {
+        return Err("--realify requires dtype c32 or c64".to_string());
+    }
 
     match tensors_file.dtype {
         Dtype::F32 => run_real(
@@ -35,6 +42,24 @@ pub fn run(
             output,
             pretty,
             |value| value,
+            |value| value,
+        ),
+        Dtype::C32 if realify => run_complex_realified(
+            &tensors_file,
+            topology_path,
+            expr,
+            output,
+            pretty,
+            |re, im| Complex32::new(re as f32, im as f32),
+            |value| value as f64,
+        ),
+        Dtype::C64 if realify => run_complex_realified(
+            &tensors_file,
+            topology_path,
+            expr,
+            output,
+            pretty,
+            Complex64::new,
             |value| value,
         ),
         Dtype::C32 => run_complex(
@@ -77,6 +102,33 @@ where
     let result = ein.execute::<Standard<T>, T, Cpu>(&tensor_refs);
     let result_data = serialize_real_tensor_data(&result, tensors_file.order, to_f64);
 
+    let result_file = ResultFile {
+        dtype: tensors_file.dtype,
+        order: tensors_file.order,
+        shape: result_data.shape,
+        data: result_data.data,
+    };
+    write_json_output(&result_file, output, pretty)
+}
+
+fn run_complex_realified<T>(
+    tensors_file: &TensorsFile,
+    topology_path: Option<&str>,
+    expr: Option<&str>,
+    output: Option<&str>,
+    pretty: Option<bool>,
+    make_complex: fn(f64, f64) -> num_complex::Complex<T>,
+    to_f64: fn(T) -> f64,
+) -> Result<(), String>
+where
+    T: Scalar + num_traits::Float + BackendScalar<Cpu>,
+    num_complex::Complex<T>: Scalar + BackendScalar<Cpu>,
+    Standard<T>: Algebra<Scalar = T, Index = u32>,
+{
+    let prepared = prepare(tensors_file, topology_path, expr, make_complex)?;
+    let tensor_refs: Vec<&Tensor<T, Cpu>> = prepared.tensors.iter().collect();
+    let result = prepared.einsum.execute::<Standard<T>, T, Cpu>(&tensor_refs);
+    let result_data = serialize_realified_complex_tensor_data(&result, tensors_file.order, to_f64);
     let result_file = ResultFile {
         dtype: tensors_file.dtype,
         order: tensors_file.order,

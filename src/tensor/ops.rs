@@ -1,5 +1,7 @@
 //! Tensor operations for contraction.
 
+use std::collections::HashMap;
+
 use super::Tensor;
 use crate::algebra::{Algebra, Scalar};
 use crate::backend::{Backend, BackendScalar};
@@ -50,6 +52,30 @@ fn compute_output_shape(
         shape_map.insert(m, shape_b[idx]);
     }
     modes_c.iter().map(|m| shape_map[m]).collect()
+}
+
+fn dense_modes(ia: &[usize], ib: &[usize], iy: &[usize]) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    fn map_modes(labels: &[usize], modes: &mut HashMap<usize, i32>) -> Vec<i32> {
+        labels
+            .iter()
+            .map(|&label| {
+                if let Some(&mode) = modes.get(&label) {
+                    mode
+                } else {
+                    let mode = i32::try_from(modes.len())
+                        .expect("binary contraction has too many distinct index labels");
+                    modes.insert(label, mode);
+                    mode
+                }
+            })
+            .collect()
+    }
+
+    let mut modes = HashMap::new();
+    let modes_a = map_modes(ia, &mut modes);
+    let modes_b = map_modes(ib, &mut modes);
+    let modes_c = map_modes(iy, &mut modes);
+    (modes_a, modes_b, modes_c)
 }
 
 impl<T: Scalar, B: Backend> Tensor<T, B> {
@@ -206,10 +232,9 @@ impl<T: Scalar, B: Backend> Tensor<T, B> {
             );
         }
 
-        // Convert usize indices to i32 modes
-        let modes_a: Vec<i32> = ia.iter().map(|&i| i as i32).collect();
-        let modes_b: Vec<i32> = ib.iter().map(|&i| i as i32).collect();
-        let modes_c: Vec<i32> = output_indices.iter().map(|&i| i as i32).collect();
+        // Backends use i32 modes, while the public API permits arbitrary usize
+        // labels. Dense remapping preserves label identity without narrowing.
+        let (modes_a, modes_b, modes_c) = dense_modes(ia, ib, output_indices);
 
         // Compute output shape
         let shape_c =
@@ -272,6 +297,23 @@ mod tests {
 
         assert_eq!(c.shape(), &[2, 2]);
         assert_eq!(c.to_vec(), vec![7.0, 10.0, 15.0, 22.0]);
+    }
+
+    #[test]
+    fn test_contract_binary_preserves_distinct_large_labels() {
+        let a = Tensor::<f32, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let b = Tensor::<f32, Cpu>::from_data(&[5.0, 6.0], &[2]);
+        let aliased_if_narrowed = u32::MAX as usize;
+
+        let c = a.contract_binary::<Standard<f32>>(
+            &b,
+            &[aliased_if_narrowed, usize::MAX],
+            &[usize::MAX],
+            &[aliased_if_narrowed],
+        );
+
+        assert_eq!(c.shape(), &[2]);
+        assert_eq!(c.to_vec(), vec![23.0, 34.0]);
     }
 
     #[cfg(feature = "tropical")]

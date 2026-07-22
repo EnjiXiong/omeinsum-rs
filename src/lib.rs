@@ -62,6 +62,7 @@
 pub mod algebra;
 pub mod backend;
 pub mod einsum;
+pub mod realify;
 pub mod tensor;
 
 #[cfg(test)]
@@ -71,6 +72,10 @@ pub(crate) mod test_support;
 pub use algebra::{Algebra, Complex32, Complex64, GenericSemiring, Semiring, Standard};
 pub use backend::{Backend, BackendScalar, Cpu, Storage};
 pub use einsum::{cost_and_gradient, einsum, einsum_with_grad, EinBuilder, Einsum};
+pub use realify::{
+    realify_code, realify_data, realify_einsum, split_re_im, RealifiedOutput, RealifyInput,
+    RealifyPlan,
+};
 pub use tensor::{Tensor, TensorView};
 
 #[cfg(feature = "tropical")]
