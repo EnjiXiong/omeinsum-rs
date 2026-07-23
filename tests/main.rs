@@ -22,6 +22,8 @@ mod omeinsum_compat;
 mod optimizer;
 #[path = "suites/showcase.rs"]
 mod showcase;
+#[path = "suites/static_plan.rs"]
+mod static_plan;
 #[cfg(feature = "tropical")]
 #[path = "suites/tropical.rs"]
 mod tropical;

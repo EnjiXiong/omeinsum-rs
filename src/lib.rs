@@ -62,6 +62,7 @@
 pub mod algebra;
 pub mod backend;
 pub mod einsum;
+pub mod static_plan;
 pub mod tensor;
 
 #[cfg(test)]
