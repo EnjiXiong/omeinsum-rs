@@ -1,10 +1,13 @@
 use omeinsum::static_plan::{
-    build_geometry_plan, build_plan_bundle, contract_complex64, prepare_cpu_f32, prepare_cpu_f64,
-    BinaryContractionTree, ComplexNetwork, ComplexTensor, InputSet, InputTensor, KernelKind,
-    LeafClass, PlanBundle, PlanStats, Plane, Representation, ScratchRole, StaticPlan, TensorSpec,
-    ValueId, ValueSpec,
+    benchmark_prepared, build_geometry_plan, build_plan_bundle, contract_complex64,
+    prepare_cpu_f32, prepare_cpu_f64, BenchmarkConfig, BenchmarkTarget, BinaryContractionTree,
+    ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind,
+    LeafClass, PlanBundle, PlanStats, Plane, PreparedExecutable, Representation, ScratchRole,
+    StaticPlan, TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn one_leaf_plan(
     representation: Representation,
@@ -175,6 +178,53 @@ fn vector_chain_tree(leaves: usize) -> BinaryContractionTree {
         };
     }
     tree
+}
+
+struct FakeExecutable {
+    id: usize,
+    delay: Duration,
+    value: ComplexValue,
+    enqueues_since_sync: usize,
+    batches: Vec<usize>,
+    order: Arc<Mutex<Vec<usize>>>,
+}
+
+impl FakeExecutable {
+    fn new(id: usize, delay: Duration, value: ComplexValue, order: Arc<Mutex<Vec<usize>>>) -> Self {
+        Self {
+            id,
+            delay,
+            value,
+            enqueues_since_sync: 0,
+            batches: vec![],
+            order,
+        }
+    }
+}
+
+impl PreparedExecutable for FakeExecutable {
+    fn representation(&self) -> Representation {
+        Representation::RealSkeleton
+    }
+
+    fn enqueue(&mut self) -> Result<(), ExecutionError> {
+        self.enqueues_since_sync += 1;
+        self.order.lock().unwrap().push(self.id);
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        Ok(())
+    }
+
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
+        self.batches.push(self.enqueues_since_sync);
+        self.enqueues_since_sync = 0;
+        Ok(())
+    }
+
+    fn output(&mut self) -> Result<ComplexValue, ExecutionError> {
+        Ok(self.value)
+    }
 }
 
 #[test]
@@ -715,4 +765,173 @@ fn complex_reference_matches_two_leaf_flat_and_selective_results() {
         assert!((actual.re - reference.re).abs() <= 1e-12);
         assert!((actual.im - reference.im).abs() <= 1e-12);
     }
+}
+
+#[test]
+fn benchmark_protocol_calibrates_interleaves_and_summarizes_samples() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut fast = FakeExecutable::new(
+        0,
+        Duration::from_micros(100),
+        ComplexValue { re: 1.0, im: 0.0 },
+        Arc::clone(&order),
+    );
+    let mut slow = FakeExecutable::new(
+        1,
+        Duration::from_millis(2),
+        ComplexValue { re: 2.0, im: 0.0 },
+        Arc::clone(&order),
+    );
+    let config = BenchmarkConfig {
+        warmups: 3,
+        samples: 5,
+        min_sample_ms: 1,
+        measurement_order_seed: 20260723,
+    };
+    let timings = {
+        let mut targets = [
+            BenchmarkTarget {
+                backend: "fast",
+                dtype: "f64",
+                execution_mode: "prepared",
+                executable: &mut fast,
+            },
+            BenchmarkTarget {
+                backend: "slow",
+                dtype: "f64",
+                execution_mode: "prepared",
+                executable: &mut slow,
+            },
+        ];
+        benchmark_prepared(&mut targets, &config).unwrap()
+    };
+
+    assert_eq!(timings.len(), 2);
+    for timing in &timings {
+        assert_eq!(timing.raw_seconds_per_contraction.len(), 5);
+        let mut sorted = timing.raw_seconds_per_contraction.clone();
+        sorted.sort_by(f64::total_cmp);
+        assert_eq!(timing.best_seconds, sorted[0]);
+        assert_eq!(timing.median_seconds, sorted[2]);
+        assert_eq!(
+            timing.iqr_seconds,
+            (sorted[3] + sorted[4]) / 2.0 - (sorted[0] + sorted[1]) / 2.0
+        );
+    }
+    let fast_timing = timings
+        .iter()
+        .find(|timing| timing.backend == "fast")
+        .unwrap();
+    let slow_timing = timings
+        .iter()
+        .find(|timing| timing.backend == "slow")
+        .unwrap();
+    assert_eq!(slow_timing.inner_iterations, 1);
+
+    assert_eq!(&fast.batches[..3], &[1, 1, 1]);
+    assert_eq!(&slow.batches[..3], &[1, 1, 1]);
+    let fast_calibration = &fast.batches[3..fast.batches.len() - 5];
+    assert_eq!(fast_calibration.first(), Some(&1));
+    assert!(fast_calibration
+        .windows(2)
+        .all(|window| window[1] == 2 * window[0]));
+    assert!(fast.batches[fast.batches.len() - 5..]
+        .iter()
+        .all(|iterations| *iterations == fast_timing.inner_iterations));
+}
+
+fn benchmark_event_order(seed: u64) -> Vec<usize> {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut first = FakeExecutable::new(
+        0,
+        Duration::from_millis(2),
+        ComplexValue { re: 0.0, im: 0.0 },
+        Arc::clone(&order),
+    );
+    let mut second = FakeExecutable::new(
+        1,
+        Duration::from_millis(2),
+        ComplexValue { re: 0.0, im: 0.0 },
+        Arc::clone(&order),
+    );
+    let mut third = FakeExecutable::new(
+        2,
+        Duration::from_millis(2),
+        ComplexValue { re: 0.0, im: 0.0 },
+        Arc::clone(&order),
+    );
+    {
+        let mut targets = [
+            BenchmarkTarget {
+                backend: "first",
+                dtype: "f64",
+                execution_mode: "prepared",
+                executable: &mut first,
+            },
+            BenchmarkTarget {
+                backend: "second",
+                dtype: "f64",
+                execution_mode: "prepared",
+                executable: &mut second,
+            },
+            BenchmarkTarget {
+                backend: "third",
+                dtype: "f64",
+                execution_mode: "prepared",
+                executable: &mut third,
+            },
+        ];
+        benchmark_prepared(
+            &mut targets,
+            &BenchmarkConfig {
+                warmups: 3,
+                samples: 5,
+                min_sample_ms: 1,
+                measurement_order_seed: seed,
+            },
+        )
+        .unwrap();
+    }
+    let events = order.lock().unwrap().clone();
+    events
+}
+
+#[test]
+fn benchmark_interleaving_is_seeded_and_nonfinite_outputs_fail() {
+    assert_eq!(
+        benchmark_event_order(20260723),
+        benchmark_event_order(20260723)
+    );
+    assert_ne!(
+        benchmark_event_order(20260723),
+        benchmark_event_order(20260724)
+    );
+
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut invalid = FakeExecutable::new(
+        0,
+        Duration::from_millis(2),
+        ComplexValue {
+            re: f64::NAN,
+            im: 0.0,
+        },
+        order,
+    );
+    let mut targets = [BenchmarkTarget {
+        backend: "invalid",
+        dtype: "f64",
+        execution_mode: "prepared",
+        executable: &mut invalid,
+    }];
+    let error = benchmark_prepared(
+        &mut targets,
+        &BenchmarkConfig {
+            warmups: 1,
+            samples: 1,
+            min_sample_ms: 1,
+            measurement_order_seed: 7,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, ExecutionError::NonFiniteOutput(_)));
 }
