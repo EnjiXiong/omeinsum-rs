@@ -113,6 +113,10 @@ name = "realify_ascend_study"
 path = "examples/realify_ascend_study.rs"
 required-features = ["ascend"]
 
+[[example]]
+name = "network_benchmark"
+path = "examples/network_benchmark.rs"
+
 [workspace]
 members = [".", "omeinsum-cli"]
 
