@@ -4,12 +4,13 @@
 
 pub mod context;
 mod error;
+pub(crate) mod executable;
 pub(crate) mod ffi;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
 
-use crate::static_plan::ExecutionError;
+use crate::static_plan::{ExecutionError, InputSet, Representation, StaticPlan};
 
 use context::Context;
 
@@ -65,6 +66,14 @@ pub struct AscendSession {
     pub(crate) device_info: AscendDeviceInfo,
 }
 
+pub struct AscendExecutable<'session> {
+    pub(crate) session: &'session AscendSession,
+    pub(crate) representation: Representation,
+    pub(crate) state: executable::ExecutableState<'session>,
+    pub(crate) memory_stats: AscendMemoryStats,
+    pub(crate) capture_status: CaptureStatus,
+}
+
 impl AscendSession {
     pub fn new(config: &AscendSessionConfig) -> Result<Self, ExecutionError> {
         if config.precision_mode != AscendPrecisionMode::KeepDtype {
@@ -98,5 +107,36 @@ impl AscendSession {
         buffer.copy_d2h(0, &mut output)?;
         self.context.synchronize()?;
         Ok(output)
+    }
+}
+
+impl<'session> AscendExecutable<'session> {
+    pub fn prepare(
+        session: &'session AscendSession,
+        plan: &StaticPlan,
+        inputs: &InputSet<f64>,
+        config: &AscendExecutableConfig,
+    ) -> Result<Self, ExecutionError> {
+        if config.execution_mode != AscendExecutionMode::RepeatableAclnn {
+            return Err(ExecutionError::Unsupported(
+                "captured Ascend execution is not enabled yet".to_string(),
+            ));
+        }
+        let (state, memory_stats) = executable::ExecutableState::reserve(session, plan, inputs)?;
+        Ok(Self {
+            session,
+            representation: plan.representation.clone(),
+            state,
+            memory_stats,
+            capture_status: CaptureStatus::NotRequested,
+        })
+    }
+
+    pub fn memory_stats(&self) -> &AscendMemoryStats {
+        &self.memory_stats
+    }
+
+    pub fn capture_status(&self) -> &CaptureStatus {
+        &self.capture_status
     }
 }

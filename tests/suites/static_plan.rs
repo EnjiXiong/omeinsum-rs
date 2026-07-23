@@ -1,9 +1,10 @@
 use omeinsum::static_plan::{
-    benchmark_prepared, build_geometry_plan, build_plan_bundle, contract_complex64,
-    prepare_cpu_f32, prepare_cpu_f64, BenchmarkConfig, BenchmarkTarget, BinaryContractionTree,
-    ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind,
-    LeafClass, PlanBundle, PlanStats, Plane, PreparedExecutable, Representation, ScratchRole,
-    StaticPlan, TensorSpec, ValueId, ValueSpec,
+    allocate_live_ranges, benchmark_prepared, build_geometry_plan, build_plan_bundle,
+    contract_complex64, plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, ArenaSlot,
+    BenchmarkConfig, BenchmarkTarget, BinaryContractionTree, ComplexNetwork, ComplexTensor,
+    ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind, LeafClass, LiveRange,
+    PlanBundle, PlanStats, Plane, PreparedExecutable, Representation, ScratchRole, StaticPlan,
+    TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Mutex};
@@ -934,4 +935,121 @@ fn benchmark_interleaving_is_seeded_and_nonfinite_outputs_fail() {
     )
     .unwrap_err();
     assert!(matches!(error, ExecutionError::NonFiniteOutput(_)));
+}
+
+#[test]
+fn arena_forked_tree_keeps_overlapping_intermediates_disjoint() {
+    let ranges = vec![
+        LiveRange::new(ValueId(0), 0, 0, 64, 256),
+        LiveRange::new(ValueId(1), 0, 0, 64, 256),
+        LiveRange::new(ValueId(2), 0, 1, 64, 256),
+        LiveRange::new(ValueId(3), 0, 1, 64, 256),
+        LiveRange::new(ValueId(4), 0, 2, 64, 256),
+        LiveRange::new(ValueId(5), 1, 2, 64, 256),
+        LiveRange::new(ValueId(6), 2, 2, 64, 256),
+    ];
+    let plan = allocate_live_ranges(&ranges).unwrap();
+    assert_eq!(
+        plan.slots,
+        vec![
+            ArenaSlot::new(ValueId(0), 0, 64),
+            ArenaSlot::new(ValueId(1), 256, 64),
+            ArenaSlot::new(ValueId(2), 512, 64),
+            ArenaSlot::new(ValueId(3), 768, 64),
+            ArenaSlot::new(ValueId(4), 1024, 64),
+            ArenaSlot::new(ValueId(5), 0, 64),
+            ArenaSlot::new(ValueId(6), 256, 64),
+        ]
+    );
+    assert_eq!(plan.arena_bytes, 1280);
+    assert_eq!(plan.semantic_peak_bytes, 320);
+}
+
+#[test]
+fn arena_chain_reuses_expired_storage_at_the_lowest_offset() {
+    let ranges = vec![
+        LiveRange::new(ValueId(0), 0, 0, 64, 256),
+        LiveRange::new(ValueId(1), 0, 0, 64, 256),
+        LiveRange::new(ValueId(2), 0, 1, 64, 256),
+        LiveRange::new(ValueId(3), 0, 1, 64, 256),
+        LiveRange::new(ValueId(4), 1, 2, 64, 256),
+        LiveRange::new(ValueId(5), 2, 2, 64, 256),
+    ];
+    let first = allocate_live_ranges(&ranges).unwrap();
+    let second = allocate_live_ranges(&ranges).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        first.slots,
+        vec![
+            ArenaSlot::new(ValueId(0), 0, 64),
+            ArenaSlot::new(ValueId(1), 256, 64),
+            ArenaSlot::new(ValueId(2), 512, 64),
+            ArenaSlot::new(ValueId(3), 768, 64),
+            ArenaSlot::new(ValueId(4), 0, 64),
+            ArenaSlot::new(ValueId(5), 256, 64),
+        ]
+    );
+    assert_eq!(first.arena_bytes, 1024);
+}
+
+#[test]
+fn arena_random_live_ranges_are_aligned_in_bounds_and_non_aliasing() {
+    for seed in 0..100u64 {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let count = rng.random_range(1..32);
+        let ranges = (0..count)
+            .map(|value| {
+                let start = rng.random_range(0..12);
+                let end = rng.random_range(start..12);
+                let alignment = [64, 128, 256, 512][rng.random_range(0..4)];
+                LiveRange::new(
+                    ValueId(value),
+                    start,
+                    end,
+                    rng.random_range(1..1500),
+                    alignment,
+                )
+            })
+            .collect::<Vec<_>>();
+        let first = allocate_live_ranges(&ranges).unwrap();
+        let second = allocate_live_ranges(&ranges).unwrap();
+        assert_eq!(first, second, "seed {seed}");
+        for (range, slot) in ranges.iter().zip(&first.slots) {
+            assert_eq!(range.value, slot.value);
+            assert_eq!(slot.offset % range.alignment, 0, "seed {seed}");
+            assert!(
+                slot.offset.checked_add(slot.bytes).unwrap() <= first.arena_bytes,
+                "seed {seed}"
+            );
+        }
+        for left in 0..ranges.len() {
+            for right in left + 1..ranges.len() {
+                let time_overlaps = ranges[left].start <= ranges[right].end
+                    && ranges[right].start <= ranges[left].end;
+                if !time_overlaps {
+                    continue;
+                }
+                let left_slot = &first.slots[left];
+                let right_slot = &first.slots[right];
+                let space_disjoint = left_slot.offset + left_slot.bytes <= right_slot.offset
+                    || right_slot.offset + right_slot.bytes <= left_slot.offset;
+                assert!(space_disjoint, "seed {seed}, values {left}/{right}");
+            }
+        }
+    }
+}
+
+#[test]
+fn arena_plans_every_static_f32_semantic_plane() {
+    let bundle = build_plan_bundle(&two_leaf_scalar_network(0.25, 0.0), 1e-12).unwrap();
+    for plan in [
+        &bundle.real_skeleton,
+        &bundle.flat_4m,
+        &bundle.realified_rank3,
+    ] {
+        let arena = plan_f32_arena(plan).unwrap();
+        assert_eq!(arena.slots.len(), plan.values.len());
+        assert!(arena.slots.iter().all(|slot| slot.offset % 256 == 0));
+        assert!(arena.semantic_peak_bytes <= arena.arena_bytes);
+    }
 }
