@@ -1,16 +1,14 @@
-//! Matched standard-f32 tensor-network benchmark for one CUDA GPU or Ascend NPU.
-//!
-//! Build exactly one backend at a time:
-//! `cargo build --release --features cuda --example network_benchmark`
-//! `cargo build --release --features ascend --example network_benchmark`
+//! Matched real-f32 tensor-network benchmark for one CUDA GPU or Ascend NPU.
 
 #[cfg(all(feature = "cuda", feature = "ascend"))]
 compile_error!("network_benchmark requires exactly one of `cuda` or `ascend`");
 
-use omeco::{EinCode, NestedEinsum};
-use omeinsum::{Backend, BackendScalar, Cpu, Einsum, Standard, Tensor};
-use serde::Deserialize;
-use std::{collections::HashMap, fs::File, hint::black_box, io::BufReader, time::Instant};
+#[path = "support/yao_benchmark.rs"]
+mod format;
+
+use format::BenchmarkNetwork;
+use omeinsum::{Backend, Cpu, Standard};
+use std::{fs::File, hint::black_box, io::BufReader, time::Instant};
 
 #[cfg(all(feature = "ascend", not(feature = "cuda")))]
 use omeinsum::Ascend as Device;
@@ -19,92 +17,42 @@ use omeinsum::Cpu as Device;
 #[cfg(all(feature = "cuda", not(feature = "ascend")))]
 use omeinsum::Cuda as Device;
 
-#[derive(Deserialize)]
-struct NetworkJson {
-    #[serde(rename = "n_vertices")]
-    _n_vertices: usize,
-    bond_dim: usize,
-    edges: Vec<(usize, usize)>,
-    tree: TreeNodeJson,
+struct Args {
+    path: String,
+    warmup: usize,
+    repeats: usize,
+    check_cpu: bool,
 }
 
-#[derive(Deserialize)]
-struct TreeNodeJson {
-    #[serde(rename = "isleaf")]
-    is_leaf: bool,
-    tensorindex: Option<usize>,
-    eins: Option<EinsJson>,
-    args: Option<Vec<TreeNodeJson>>,
-}
-
-#[derive(Deserialize)]
-struct EinsJson {
-    ixs: Vec<Vec<usize>>,
-    iy: Vec<usize>,
-}
-
-fn nested(node: &TreeNodeJson) -> NestedEinsum<usize> {
-    if node.is_leaf {
-        NestedEinsum::leaf(node.tensorindex.expect("leaf missing tensor index"))
-    } else {
-        let eins = node.eins.as_ref().expect("internal node missing einsum");
-        NestedEinsum::node(
-            node.args
-                .as_ref()
-                .expect("internal node missing arguments")
-                .iter()
-                .map(nested)
-                .collect(),
-            EinCode::new(eins.ixs.clone(), eins.iy.clone()),
-        )
-    }
-}
-
-fn parse_args() -> (String, usize, usize) {
+fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
         .unwrap_or_else(|| "benches/network_small.json".to_string());
     let mut warmup = 3;
     let mut repeats = 20;
+    let mut check_cpu = false;
     while let Some(flag) = args.next() {
-        let value = args.next().expect("flag requires a value");
         match flag.as_str() {
-            "--warmup" => warmup = value.parse().expect("--warmup requires an integer"),
-            "--repeats" => repeats = value.parse().expect("--repeats requires an integer"),
+            "--check-cpu" => check_cpu = true,
+            "--warmup" | "--repeats" => {
+                let value = args.next().expect("flag requires a value");
+                match flag.as_str() {
+                    "--warmup" => warmup = value.parse().expect("--warmup requires an integer"),
+                    "--repeats" => repeats = value.parse().expect("--repeats requires an integer"),
+                    _ => unreachable!(),
+                }
+            }
             _ => panic!("unknown flag {flag}"),
         }
     }
     assert!(repeats > 0, "--repeats must be positive");
-    (path, warmup, repeats)
-}
-
-fn build_einsum(network: &NetworkJson) -> Einsum<usize> {
-    let ixs = network.edges.iter().map(|&(u, v)| vec![u, v]).collect();
-    let sizes = network
-        .edges
-        .iter()
-        .flat_map(|&(u, v)| [(u, network.bond_dim), (v, network.bond_dim)])
-        .collect::<HashMap<_, _>>();
-    let mut einsum = Einsum::new(ixs, vec![], sizes);
-    einsum.set_contraction_tree(nested(&network.tree));
-    einsum
-}
-
-fn tensors<B>(network: &NetworkJson, backend: B) -> Vec<Tensor<f32, B>>
-where
-    B: Backend + Clone,
-    f32: BackendScalar<B>,
-{
-    let shape = [network.bond_dim, network.bond_dim];
-    let data: Vec<f32> = (0..shape.iter().product())
-        .map(|index| (index + 1) as f32 / 8.0)
-        .collect();
-    network
-        .edges
-        .iter()
-        .map(|_| Tensor::from_data_with_backend(&data, &shape, backend.clone()))
-        .collect()
+    Args {
+        path,
+        warmup,
+        repeats,
+        check_cpu,
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "ascend"))]
@@ -117,56 +65,86 @@ fn device() -> Device {
     Cpu
 }
 
-fn main() {
-    let (path, warmup, repeats) = parse_args();
-    let network: NetworkJson = serde_json::from_reader(BufReader::new(
-        File::open(&path).unwrap_or_else(|error| panic!("failed to open {path}: {error}")),
-    ))
-    .expect("invalid network JSON");
-    let einsum = build_einsum(&network);
+fn max_abs_error(expected: &[f32], actual: &[f32]) -> f32 {
+    assert_eq!(
+        expected.len(),
+        actual.len(),
+        "CPU/device result length mismatch"
+    );
+    expected
+        .iter()
+        .zip(actual)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, f32::max)
+}
 
-    let cpu_tensors = tensors(&network, Cpu);
-    let cpu_refs = cpu_tensors.iter().collect::<Vec<_>>();
-    let expected = einsum
-        .execute::<Standard<f32>, f32, Cpu>(&cpu_refs)
-        .to_vec();
+fn main() {
+    let args = parse_args();
+    let network: BenchmarkNetwork = serde_json::from_reader(BufReader::new(
+        File::open(&args.path)
+            .unwrap_or_else(|error| panic!("failed to open {}: {error}", args.path)),
+    ))
+    .expect("invalid benchmark network JSON");
+    assert_eq!(network.format, "omeinsum-real-f32-benchmark-v1");
+    let einsum = network.einsum();
+
+    let expected = args.check_cpu.then(|| {
+        let tensors = network.tensors(Cpu);
+        let refs = tensors.iter().collect::<Vec<_>>();
+        einsum.execute::<Standard<f32>, f32, Cpu>(&refs).to_vec()
+    });
 
     let device = device();
-    let device_tensors = tensors(&network, device.clone());
-    let device_refs = device_tensors.iter().collect::<Vec<_>>();
-    let actual = einsum
-        .execute::<Standard<f32>, f32, Device>(&device_refs)
-        .to_vec();
-    let max_abs_error = expected
-        .iter()
-        .zip(&actual)
-        .map(|(left, right)| (left - right).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        max_abs_error <= 1.0e-3,
-        "max absolute error {max_abs_error}"
-    );
+    let tensors = network.tensors(device.clone());
+    let refs = tensors.iter().collect::<Vec<_>>();
+    let initial = einsum.execute::<Standard<f32>, f32, Device>(&refs);
+    device.synchronize();
+    let initial_values = initial.to_vec();
+    let error = expected
+        .as_ref()
+        .map(|values| max_abs_error(values, &initial_values));
 
-    for _ in 0..warmup {
-        let result = einsum.execute::<Standard<f32>, f32, Device>(&device_refs);
+    for _ in 0..args.warmup {
+        let result = einsum.execute::<Standard<f32>, f32, Device>(&refs);
         device.synchronize();
         black_box(result);
     }
 
-    let mut times_ms = Vec::with_capacity(repeats);
-    for _ in 0..repeats {
+    let mut times_ms = Vec::with_capacity(args.repeats);
+    for _ in 0..args.repeats {
         let start = Instant::now();
-        let result = einsum.execute::<Standard<f32>, f32, Device>(&device_refs);
+        let result = einsum.execute::<Standard<f32>, f32, Device>(&refs);
         device.synchronize();
         times_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
         black_box(result);
     }
     times_ms.sort_by(f64::total_cmp);
-    let mean = times_ms.iter().sum::<f64>() / repeats as f64;
+    let mean = times_ms.iter().sum::<f64>() / args.repeats as f64;
     let median = times_ms[times_ms.len() / 2];
+    let checksum = initial_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index + 1) as f64 * *value as f64)
+        .sum::<f64>();
     println!(
-        "backend={} network={} tensors={} bond_dim={} dtype=f32 scope=contraction warmup={} repeats={} max_abs_error={:.9}",
-        Device::name(), path, network.edges.len(), network.bond_dim, warmup, repeats, max_abs_error
+        "backend={} network={} tensors={} dtype=f32 scope=contraction warmup={} repeats={} cpu_check={} max_abs_error={}",
+        Device::name(),
+        args.path,
+        network.tensors.len(),
+        args.warmup,
+        args.repeats,
+        args.check_cpu,
+        error.map_or_else(|| "not-run".to_string(), |value| format!("{value:.9}"))
+    );
+    println!(
+        "complexity log2_flops={:.6} log2_peak_elements={:.6} estimated_peak_bytes_f32={:.0}",
+        network.complexity.log2_flops,
+        network.complexity.log2_peak_elements,
+        network.complexity.estimated_peak_bytes_f32
+    );
+    println!(
+        "result elements={} checksum={checksum:.12e}",
+        initial_values.len()
     );
     println!(
         "wall_clock_ms mean={mean:.6} median={median:.6} min={:.6} max={:.6}",
