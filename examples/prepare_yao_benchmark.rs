@@ -7,7 +7,7 @@ use format::{
     BenchmarkEinCode, BenchmarkNetwork, BenchmarkTensor, Complexity, TreeNode, YaoNetwork,
 };
 use num_complex::Complex32;
-use omeco::{contraction_complexity, optimize_code, GreedyMethod};
+use omeco::{contraction_complexity, optimize_code, TreeSA};
 use omeinsum::realify::constants;
 use omeinsum::{realify_code, realify_data};
 use std::{collections::HashMap, fs::File, io::BufReader};
@@ -107,16 +107,19 @@ fn main() {
         data: constants::M_DATA.map(|value| value as f32).to_vec(),
     }));
 
-    let optimizer = GreedyMethod::new(0.0, 0.0);
+    // TreeSA seeds trial 0 with 42, so this one-trial configuration is reproducible.
+    // The 2^28-element target leaves headroom beyond the largest intermediate on
+    // both the 64 GiB Ascend device and 80 GiB A800.
+    let optimizer = TreeSA::fast().with_sc_target(28.0);
     let code = plan.einsum.code();
     let tree = optimize_code(&code, &plan.einsum.size_dict, &optimizer)
-        .expect("deterministic greedy optimizer produced no contraction tree");
+        .expect("deterministic TreeSA optimizer produced no contraction tree");
     let complexity = contraction_complexity(&tree, &plan.einsum.size_dict, &plan.einsum.ixs);
     let artifact = BenchmarkNetwork {
         format: "omeinsum-real-f32-benchmark-v1".to_string(),
         source_format: source.format,
         source_mode: source.mode,
-        optimizer: "omeco-greedy-alpha0-temperature0".to_string(),
+        optimizer: "omeco-treesa-fast-ntrials1-niters20-seed42-sc-target28".to_string(),
         realification: format!(
             "omeinsum-realify-v1;complex_inputs={complex_inputs};multiplication_vertices={}",
             plan.num_mul_vertices
