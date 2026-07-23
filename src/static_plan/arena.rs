@@ -72,6 +72,13 @@ pub fn plan_f32_arena(plan: &StaticPlan) -> Result<ArenaPlan, PlanError> {
         ends[node.left.0] = ends[node.left.0].max(node_index);
         ends[node.right.0] = ends[node.right.0].max(node_index);
     }
+    // Prepared executables enqueue the same fixed-address operator sequence
+    // repeatedly without another H2D copy. Keep uploaded leaves alive for the
+    // whole sequence so no computed value can overwrite the next enqueue's
+    // immutable inputs.
+    for leaf in &plan.leaf_values {
+        ends[leaf.0] = final_node;
+    }
     if plan.output.0 >= leaf_count {
         ends[plan.output.0] = ends[plan.output.0].max(final_node);
     } else {

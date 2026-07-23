@@ -1055,6 +1055,29 @@ fn arena_plans_every_static_f32_semantic_plane() {
 }
 
 #[test]
+fn arena_keeps_uploaded_leaves_disjoint_for_repeatable_execution() {
+    let bundle = build_plan_bundle(&matrix_scalar_network(0.25, -0.5), 1e-12).unwrap();
+    for plan in [
+        &bundle.real_skeleton,
+        &bundle.flat_4m,
+        &bundle.realified_rank3,
+    ] {
+        let arena = plan_f32_arena(plan).unwrap();
+        for leaf in &arena.slots[..plan.leaf_values.len()] {
+            for computed in &arena.slots[plan.leaf_values.len()..] {
+                let disjoint = leaf.offset + leaf.bytes <= computed.offset
+                    || computed.offset + computed.bytes <= leaf.offset;
+                assert!(
+                    disjoint,
+                    "{:?} leaf {} aliases computed value {} across repeated enqueues",
+                    plan.representation, leaf.value.0, computed.value.0
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn ascend_lowering_real_and_rides_preserve_green_plane_batching() {
     let real = build_plan_bundle(&two_leaf_scalar_network(0.0, 0.0), 1e-12).unwrap();
     let real_trace = lower_plan_traces(&real.real_skeleton).unwrap();
