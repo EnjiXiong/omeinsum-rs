@@ -2,4 +2,101 @@
 //!
 //! This module is compiled only with the `ascend` Cargo feature.
 
+pub mod context;
+mod error;
 pub(crate) mod ffi;
+pub mod storage;
+
+use serde::{Deserialize, Serialize};
+
+use crate::static_plan::ExecutionError;
+
+use context::Context;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AscendPrecisionMode {
+    KeepDtype,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AscendExecutionMode {
+    RepeatableAclnn,
+    CapturedModel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AscendSessionConfig {
+    pub device_id: i32,
+    pub precision_mode: AscendPrecisionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AscendExecutableConfig {
+    pub execution_mode: AscendExecutionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AscendMemoryStats {
+    pub semantic_bytes: u64,
+    pub device_arena_bytes: u64,
+    pub scratch_bytes: u64,
+    pub workspace_bytes: u64,
+    pub peak_device_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AscendDeviceInfo {
+    pub device_id: i32,
+    pub soc_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureStatus {
+    NotRequested,
+    Ready,
+    SkippedUnsupported { reason: String },
+}
+
+pub struct AscendSession {
+    pub(crate) context: Context,
+    pub(crate) device_info: AscendDeviceInfo,
+}
+
+impl AscendSession {
+    pub fn new(config: &AscendSessionConfig) -> Result<Self, ExecutionError> {
+        if config.precision_mode != AscendPrecisionMode::KeepDtype {
+            return Err(ExecutionError::Unsupported(
+                "Ascend supports only keep-dtype precision".to_string(),
+            ));
+        }
+        let context = Context::new(config.device_id)?;
+        let device_info = AscendDeviceInfo {
+            device_id: context.device_id(),
+            soc_name: context.soc_name().to_string(),
+        };
+        Ok(Self {
+            context,
+            device_info,
+        })
+    }
+
+    pub fn device_info(&self) -> &AscendDeviceInfo {
+        &self.device_info
+    }
+
+    #[doc(hidden)]
+    pub fn round_trip_f32(&self, values: &[f32]) -> Result<Vec<f32>, ExecutionError> {
+        let bytes = u64::try_from(std::mem::size_of_val(values))
+            .map_err(|_| ExecutionError::Unsupported("host input is too large".to_string()))?;
+        let buffer = self.context.allocate(bytes)?;
+        buffer.copy_h2d(0, values)?;
+        self.context.synchronize()?;
+        let mut output = vec![0.0f32; values.len()];
+        buffer.copy_d2h(0, &mut output)?;
+        self.context.synchronize()?;
+        Ok(output)
+    }
+}

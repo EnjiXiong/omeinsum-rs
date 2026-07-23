@@ -104,6 +104,11 @@ name = "tropical_network_gpu"
 path = "examples/tropical_network_gpu.rs"
 required-features = ["cuda-tropical"]
 
+[[example]]
+name = "ascend_context_smoke"
+path = "examples/ascend_context_smoke.rs"
+required-features = ["ascend"]
+
 [workspace]
 members = [".", "omeinsum-cli"]
 
