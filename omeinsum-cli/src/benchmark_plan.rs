@@ -155,51 +155,52 @@ fn benchmark_ascend(
                 .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let rank3 = selected
+        .iter()
+        .copied()
+        .find(|plan| plan.representation == omeinsum::static_plan::Representation::RealifiedRank3);
     let mut executables = selected
-        .into_iter()
+        .iter()
+        .copied()
         .map(|plan| {
-            if plan.representation == omeinsum::static_plan::Representation::RealifiedRank3 {
-                match capture_policy {
-                    RealifiedCapturePolicy::Off => AscendExecutable::prepare(
-                        &session,
-                        plan,
-                        &bundle.inputs,
-                        &AscendExecutableConfig {
-                            execution_mode: AscendExecutionMode::RepeatableAclnn,
-                        },
-                    ),
-                    RealifiedCapturePolicy::Auto => {
-                        AscendExecutable::prepare_auto_capture(&session, plan, &bundle.inputs)
-                    }
-                    RealifiedCapturePolicy::Required => AscendExecutable::prepare(
-                        &session,
-                        plan,
-                        &bundle.inputs,
-                        &AscendExecutableConfig {
-                            execution_mode: AscendExecutionMode::CapturedModel,
-                        },
-                    ),
-                }
-            } else {
+            AscendExecutable::prepare(
+                &session,
+                plan,
+                &bundle.inputs,
+                &AscendExecutableConfig {
+                    execution_mode: AscendExecutionMode::RepeatableAclnn,
+                },
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut capture = CaptureStatus::NotRequested;
+    if let (Some(plan), policy) = (rank3, capture_policy) {
+        let candidate = match policy {
+            RealifiedCapturePolicy::Off => None,
+            RealifiedCapturePolicy::Auto => Some(
+                AscendExecutable::prepare_auto_capture(&session, plan, &bundle.inputs)
+                    .map_err(|error| error.to_string())?,
+            ),
+            RealifiedCapturePolicy::Required => Some(
                 AscendExecutable::prepare(
                     &session,
                     plan,
                     &bundle.inputs,
                     &AscendExecutableConfig {
-                        execution_mode: AscendExecutionMode::RepeatableAclnn,
+                        execution_mode: AscendExecutionMode::CapturedModel,
                     },
                 )
+                .map_err(|error| error.to_string())?,
+            ),
+        };
+        if let Some(candidate) = candidate {
+            capture = candidate.capture_status().clone();
+            if capture == CaptureStatus::Ready {
+                executables.push(candidate);
             }
-            .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let capture = executables
-        .iter()
-        .find(|executable| {
-            executable.representation() == omeinsum::static_plan::Representation::RealifiedRank3
-        })
-        .map(|executable| executable.capture_status().clone())
-        .unwrap_or(CaptureStatus::NotRequested);
+        }
+    }
     let memory = executables
         .iter()
         .map(|executable| {
