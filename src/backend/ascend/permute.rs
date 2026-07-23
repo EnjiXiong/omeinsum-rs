@@ -7,6 +7,8 @@ use super::{
 use crate::backend::{contract_plan::materialize_strided, Storage};
 use std::{ptr, sync::Arc};
 
+const ACLNN_PERMUTE_MAX_RANK: usize = 8;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DensePermutation {
     input_shape: Vec<usize>,
@@ -34,6 +36,11 @@ pub(crate) fn dense_permutation(
         return Err(AscendError::status("Ascend invalid permutation", -1));
     }
     let numel = checked_product(shape, "Ascend permutation size overflow")?;
+    // CANN aclnnPermute rejects tensors above rank 8 with ACLNN_ERR_PARAM_INVALID.
+    // Let the caller use the existing host materialization path for those views.
+    if shape.len() > ACLNN_PERMUTE_MAX_RANK {
+        return Ok(None);
+    }
     if numel != storage_len {
         return Ok(None);
     }
@@ -262,6 +269,16 @@ mod tests {
         );
         assert_eq!(
             dense_permutation(0, &[2, 0, 3], &[1, 2, 0], &[0, 1, 2]).unwrap(),
+            None
+        );
+        assert_eq!(
+            dense_permutation(
+                512,
+                &[2; 9],
+                &[1, 2, 4, 8, 16, 32, 64, 128, 256],
+                &[1, 2, 3, 4, 5, 6, 7, 8, 0],
+            )
+            .unwrap(),
             None
         );
     }
