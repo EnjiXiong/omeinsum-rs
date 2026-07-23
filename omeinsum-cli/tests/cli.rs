@@ -15,6 +15,144 @@ fn write_temp_json(content: &str) -> NamedTempFile {
     file
 }
 
+fn two_leaf_yao_tn() -> serde_json::Value {
+    serde_json::json!({
+        "format": "yao-tn-v1",
+        "mode": "overlap",
+        "eincode": {
+            "input_indices": [["0"], ["0"]],
+            "output_indices": [],
+        },
+        "tensors": [
+            {
+                "shape": [2],
+                "data_re": [1.0, 2.0],
+                "data_im": [0.0, 0.0],
+            },
+            {
+                "shape": [2],
+                "data_re": [3.0, 4.0],
+                "data_im": [0.0, 0.0],
+            },
+        ],
+        "size_dict": {"0": 2},
+        "contraction_order": {
+            "isleaf": false,
+            "args": [
+                {"isleaf": true, "tensorindex": 0},
+                {"isleaf": true, "tensorindex": 1},
+            ],
+            "eins": {
+                "ixs": [[0], [0]],
+                "iy": [],
+            },
+        },
+    })
+}
+
+fn assert_static_plan_rejected(json: &serde_json::Value, case: &str) {
+    let input = write_temp_json(&json.to_string());
+    let output = cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "{case} unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn static_plan_rejects_invalid_yao_tn() {
+    let base = two_leaf_yao_tn();
+    let mut cases = Vec::new();
+
+    let mut value = base.clone();
+    value["format"] = "other".into();
+    cases.push(("format", value));
+
+    let mut value = base.clone();
+    value["mode"] = "pure".into();
+    cases.push(("mode", value));
+
+    let mut value = base.clone();
+    value["eincode"]["output_indices"] = serde_json::json!(["0"]);
+    cases.push(("non-scalar output", value));
+
+    let mut value = base.clone();
+    value["contraction_order"] = serde_json::Value::Null;
+    cases.push(("missing order", value));
+
+    let mut value = base.clone();
+    value["tensors"].as_array_mut().unwrap().pop();
+    cases.push(("tensor count", value));
+
+    let mut value = base.clone();
+    value["tensors"][0]["data_re"] = serde_json::json!([1.0]);
+    cases.push(("shape product", value));
+
+    let mut value = base.clone();
+    value["size_dict"] = serde_json::json!({});
+    cases.push(("missing size label", value));
+
+    let mut value = base.clone();
+    value["size_dict"]["0"] = 3.into();
+    cases.push(("inconsistent size label", value));
+
+    let mut value = base.clone();
+    value["eincode"]["input_indices"][0] = serde_json::json!(["0", "0"]);
+    value["tensors"][0]["shape"] = serde_json::json!([2, 2]);
+    value["tensors"][0]["data_re"] = serde_json::json!([1.0, 2.0, 3.0, 4.0]);
+    value["tensors"][0]["data_im"] = serde_json::json!([0.0, 0.0, 0.0, 0.0]);
+    cases.push(("repeated tensor label", value));
+
+    let mut value = base.clone();
+    value["contraction_order"]["args"][1]["tensorindex"] = 9.into();
+    cases.push(("leaf index", value));
+
+    let mut value = base;
+    value["contraction_order"]["args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"isleaf": true, "tensorindex": 0}));
+    cases.push(("non-binary node", value));
+
+    for (case, value) in cases {
+        assert_static_plan_rejected(&value, case);
+    }
+}
+
+#[test]
+fn static_plan_normalizes_optimized_yao_tn_without_changing_tree_order() {
+    let input = write_temp_json(&two_leaf_yao_tn().to_string());
+    let output = cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let normalized: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root = &normalized["tree"]["Node"];
+    assert_eq!(root["output_modes"], serde_json::json!([]));
+    assert_eq!(root["left"]["Leaf"]["tensor_index"], 0);
+    assert_eq!(root["right"]["Leaf"]["tensor_index"], 1);
+}
+
 #[test]
 fn test_optimize_matmul() {
     cmd()

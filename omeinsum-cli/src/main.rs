@@ -6,6 +6,7 @@ mod contract;
 mod format;
 mod optimize;
 mod parse;
+mod yao_tn;
 
 #[derive(Parser)]
 #[command(name = "omeinsum", version, about = "Einstein summation CLI")]
@@ -121,6 +122,20 @@ enum Commands {
         #[arg(long)]
         pretty: Option<bool>,
     },
+    /// Validate and normalize an optimized yao-tn-v1 scalar network
+    #[command(hide = true)]
+    StaticPlan {
+        /// Optimized yao-tn-v1 JSON file
+        input: String,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Pretty-print JSON (default: auto-detect TTY)
+        #[arg(long)]
+        pretty: Option<bool>,
+    },
 }
 
 fn main() {
@@ -187,6 +202,11 @@ fn main() {
             output.as_deref(),
             pretty,
         ),
+        Commands::StaticPlan {
+            input,
+            output,
+            pretty,
+        } => yao_tn::run(&input, output.as_deref(), pretty),
     };
 
     if let Err(err) = result {
