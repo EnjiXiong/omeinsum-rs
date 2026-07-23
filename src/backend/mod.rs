@@ -4,7 +4,7 @@
 //! - [`Cpu`]: CPU backend with SIMD acceleration
 //! - `Cuda`: CUDA backend (optional, requires `cuda` feature)
 
-mod contract_plan;
+pub(crate) mod contract_plan;
 mod cpu;
 mod traits;
 

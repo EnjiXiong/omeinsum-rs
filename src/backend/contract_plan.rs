@@ -223,10 +223,9 @@ pub(crate) fn gather_contiguous<T: Copy + Default>(
 /// requested `modes_c` order. Any trace modes (single-operand modes not in the
 /// output) are reported separately and must be summed out *before* the GEMM.
 ///
-/// Consumed by the CUDA tropical executor (the CPU backend keeps its own richer
-/// layout plan, and the cuTENSOR `cuda` path lowers via cuTENSOR directly), so it
-/// is compiled only under `cuda-tropical` (and in tests).
-#[cfg(any(feature = "cuda-tropical", test))]
+/// Consumed by static planners and the CUDA tropical executor (the CPU backend
+/// keeps its own richer layout plan, and the cuTENSOR `cuda` path lowers via
+/// cuTENSOR directly).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContractionPlan {
     pub batch_modes: Vec<i32>,
@@ -248,7 +247,6 @@ pub(crate) struct ContractionPlan {
     pub output_perm: Option<Vec<usize>>,
 }
 
-#[cfg(any(feature = "cuda-tropical", test))]
 impl ContractionPlan {
     /// Whether the contraction has trace modes that require a pre-reduction.
     ///
@@ -288,7 +286,6 @@ impl ContractionPlan {
 /// Pure index/shape arithmetic — no tensor data is touched. The sizes are read
 /// from whichever operand carries each mode (`modes_a`/`shape_a` for batch, left,
 /// and contracted; `modes_b`/`shape_b` for right).
-#[cfg(any(feature = "cuda-tropical", test))]
 pub(crate) fn plan_contraction(
     modes_a: &[i32],
     shape_a: &[usize],
