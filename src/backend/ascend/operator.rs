@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
+
 use std::ptr::NonNull;
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,7 @@ pub(crate) enum PreparedOpKind {
 
 pub(crate) struct PreparedOp<'context> {
     raw: NonNull<ffi::Op>,
-    kind: PreparedOpKind,
+    _kind: PreparedOpKind,
     workspace_bytes: u64,
     node_id: Option<usize>,
     logical_shape: Vec<usize>,
@@ -183,7 +185,7 @@ impl<'context> PreparedOp<'context> {
         let workspace_bytes = unsafe { ffi::ome_ascend_op_workspace_bytes(raw.as_ptr()) };
         Ok(Self {
             raw,
-            kind,
+            _kind: kind,
             workspace_bytes,
             node_id,
             logical_shape: output.shape().to_vec(),
@@ -195,10 +197,6 @@ impl<'context> PreparedOp<'context> {
 
     pub(crate) fn workspace_bytes(&self) -> u64 {
         self.workspace_bytes
-    }
-
-    pub(crate) fn kind(&self) -> PreparedOpKind {
-        self.kind
     }
 
     pub(crate) fn run(&mut self, workspace: &DeviceBuffer<'context>) -> Result<(), ExecutionError> {

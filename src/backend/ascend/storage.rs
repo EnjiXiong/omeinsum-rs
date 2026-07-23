@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
+
 use std::marker::PhantomData;
 use std::mem::size_of_val;
 use std::ptr::NonNull;

@@ -88,12 +88,14 @@ fn build_ascend() {
     let library_dir = candidates
         .iter()
         .find(|directory| {
-            has_shared_library(directory, "ascendcl") && has_shared_library(directory, "nnopbase")
+            has_shared_library(directory, "ascendcl")
+                && has_shared_library(directory, "nnopbase")
+                && has_shared_library(directory, "opapi")
         })
         .unwrap_or_else(|| {
             panic!(
-                "no CANN library directory contains both libascendcl.so and \
-                 libnnopbase.so; searched {}",
+                "no CANN library directory contains libascendcl.so, \
+                 libnnopbase.so, and libopapi.so; searched {}",
                 candidates
                     .iter()
                     .map(|path| path.display().to_string())
@@ -121,6 +123,7 @@ fn build_ascend() {
     println!("cargo:rustc-link-search=native={}", library_dir.display());
     println!("cargo:rustc-link-lib=dylib=ascendcl");
     println!("cargo:rustc-link-lib=dylib=nnopbase");
+    println!("cargo:rustc-link-lib=dylib=opapi");
 
     fn has_shared_library(directory: &Path, stem: &str) -> bool {
         directory.join(format!("lib{stem}.so")).is_file()

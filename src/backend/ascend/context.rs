@@ -19,6 +19,8 @@
 //! std::thread::spawn(move || drop(context));
 //! ```
 
+#![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
+
 use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::ptr::NonNull;

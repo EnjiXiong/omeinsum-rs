@@ -273,13 +273,12 @@ extern "C" ome_ascend_status_t ome_ascend_buffer_copy_h2d(
             return ok();
         }
         auto *destination = static_cast<uint8_t *>(buffer->device) + offset;
-        const aclError code = aclrtMemcpyAsync(
+        const aclError code = aclrtMemcpy(
             destination, static_cast<size_t>(buffer->bytes - offset), host,
-            static_cast<size_t>(bytes), ACL_MEMCPY_HOST_TO_DEVICE,
-            context->stream);
+            static_cast<size_t>(bytes), ACL_MEMCPY_HOST_TO_DEVICE);
         return code == ACL_SUCCESS
                    ? ok()
-                   : runtime_error("aclrtMemcpyAsync(H2D)", code);
+                   : runtime_error("aclrtMemcpy(H2D)", code);
     });
 }
 
@@ -304,13 +303,12 @@ extern "C" ome_ascend_status_t ome_ascend_buffer_copy_d2h(
         }
         const auto *source =
             static_cast<const uint8_t *>(buffer->device) + offset;
-        const aclError code = aclrtMemcpyAsync(
+        const aclError code = aclrtMemcpy(
             host, static_cast<size_t>(bytes), source,
-            static_cast<size_t>(bytes), ACL_MEMCPY_DEVICE_TO_HOST,
-            context->stream);
+            static_cast<size_t>(bytes), ACL_MEMCPY_DEVICE_TO_HOST);
         return code == ACL_SUCCESS
                    ? ok()
-                   : runtime_error("aclrtMemcpyAsync(D2H)", code);
+                   : runtime_error("aclrtMemcpy(D2H)", code);
     });
 }
 

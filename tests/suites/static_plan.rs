@@ -1,10 +1,10 @@
 use omeinsum::static_plan::{
     allocate_live_ranges, benchmark_prepared, build_geometry_plan, build_plan_bundle,
-    contract_complex64, plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, ArenaSlot,
-    BenchmarkConfig, BenchmarkTarget, BinaryContractionTree, ComplexNetwork, ComplexTensor,
-    ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind, LeafClass, LiveRange,
-    PlanBundle, PlanStats, Plane, PreparedExecutable, Representation, ScratchRole, StaticPlan,
-    TensorSpec, ValueId, ValueSpec,
+    coalesce_permutation, contract_complex64, green_operand_plane_batches, lower_plan_traces,
+    plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, ArenaSlot, BenchmarkConfig, BenchmarkTarget,
+    BinaryContractionTree, ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet,
+    InputTensor, KernelKind, LeafClass, LiveRange, PlanBundle, PlanStats, Plane,
+    PreparedExecutable, Representation, ScratchRole, StaticPlan, TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Mutex};
@@ -1052,4 +1052,94 @@ fn arena_plans_every_static_f32_semantic_plane() {
         assert!(arena.slots.iter().all(|slot| slot.offset % 256 == 0));
         assert!(arena.semantic_peak_bytes <= arena.arena_bytes);
     }
+}
+
+#[test]
+fn ascend_lowering_real_and_rides_preserve_green_plane_batching() {
+    let real = build_plan_bundle(&two_leaf_scalar_network(0.0, 0.0), 1e-12).unwrap();
+    let real_trace = lower_plan_traces(&real.real_skeleton).unwrap();
+    assert_eq!(real_trace[0].kind, KernelKind::RealReal);
+    assert_eq!(real_trace[0].matmul_calls, 1);
+    assert_eq!(real_trace[0].green_batch, 1);
+    assert_eq!(
+        real_trace[0].real_matmul_volume,
+        real.real_skeleton.nodes[0].real_skeleton_volume
+    );
+
+    let ride_left = build_plan_bundle(&two_leaf_scalar_network(0.25, 0.0), 1e-12).unwrap();
+    let left_trace = lower_plan_traces(&ride_left.realified_rank3).unwrap();
+    assert_eq!(left_trace[0].kind, KernelKind::RideLeft);
+    assert_eq!(left_trace[0].matmul_calls, 1);
+    assert_eq!(left_trace[0].green_batch, 2);
+    assert_eq!(
+        left_trace[0].real_matmul_volume,
+        2 * ride_left.realified_rank3.nodes[0].real_skeleton_volume
+    );
+    assert_eq!(green_operand_plane_batches(KernelKind::RideLeft), (2, 1));
+
+    let ride_right = build_plan_bundle(&two_leaf_scalar_network(0.0, 0.25), 1e-12).unwrap();
+    let right_trace = lower_plan_traces(&ride_right.realified_rank3).unwrap();
+    assert_eq!(right_trace[0].kind, KernelKind::RideRight);
+    assert_eq!(right_trace[0].matmul_calls, 1);
+    assert_eq!(right_trace[0].green_batch, 2);
+    assert_eq!(green_operand_plane_batches(KernelKind::RideRight), (1, 2));
+}
+
+#[test]
+fn ascend_lowering_rank3_and_flat_have_exact_real_operator_counts() {
+    let bundle = build_plan_bundle(&two_leaf_scalar_network(0.25, -0.5), 1e-12).unwrap();
+    let merge = &bundle.realified_rank3.nodes[0];
+    let trace = lower_plan_traces(&bundle.realified_rank3).unwrap();
+    assert_eq!(trace[0].kind, KernelKind::Merge3M);
+    assert_eq!(trace[0].matmul_calls, 3);
+    assert_eq!(trace[0].elementwise_calls, 5);
+    assert_eq!(trace[0].green_batch, 1);
+    assert_eq!(trace[0].real_matmul_volume, 3 * merge.real_skeleton_volume);
+    assert!(!merge
+        .scratch
+        .iter()
+        .any(|scratch| scratch.role == ScratchRole::Product4));
+
+    let flat = &bundle.flat_4m.nodes[0];
+    let trace = lower_plan_traces(&bundle.flat_4m).unwrap();
+    assert_eq!(trace[0].kind, KernelKind::Flat4M);
+    assert_eq!(trace[0].matmul_calls, 4);
+    assert_eq!(trace[0].elementwise_calls, 2);
+    assert_eq!(trace[0].real_matmul_volume, 4 * flat.real_skeleton_volume);
+    assert_eq!(
+        flat.scratch
+            .iter()
+            .map(|scratch| scratch.role.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ScratchRole::Product1,
+            ScratchRole::Product2,
+            ScratchRole::Product3,
+            ScratchRole::Product4,
+        ]
+    );
+}
+
+#[test]
+fn ascend_lowering_coalesces_high_rank_permutations_or_rejects_them_explicitly() {
+    let dimensions = (0..10).map(|mode| (mode, 2)).collect::<Vec<_>>();
+    let collapsed = coalesce_permutation(
+        &(0..10).collect::<Vec<_>>(),
+        &[6, 7, 8, 9, 2, 3, 4, 5, 0, 1],
+        &dimensions,
+        8,
+    )
+    .unwrap();
+    assert_eq!(collapsed.input_shape, vec![4, 16, 16]);
+    assert_eq!(collapsed.axes, vec![2, 1, 0]);
+    assert_eq!(collapsed.output_shape, vec![16, 16, 4]);
+
+    let error = coalesce_permutation(
+        &(0..10).collect::<Vec<_>>(),
+        &[0, 2, 4, 6, 8, 1, 3, 5, 7, 9],
+        &dimensions,
+        8,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ExecutionError::Unsupported(_)));
 }

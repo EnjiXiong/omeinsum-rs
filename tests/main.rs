@@ -1,3 +1,6 @@
+#[cfg(feature = "ascend")]
+#[path = "suites/ascend.rs"]
+mod ascend;
 #[path = "suites/backend_contract.rs"]
 mod backend_contract;
 #[path = "suites/backward.rs"]

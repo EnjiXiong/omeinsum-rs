@@ -2,6 +2,8 @@
 //!
 //! This module is compiled only with the `ascend` Cargo feature.
 
+#![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
+
 pub mod context;
 mod error;
 pub(crate) mod executable;
@@ -124,7 +126,7 @@ impl<'session> AscendExecutable<'session> {
                 "captured Ascend execution is not enabled yet".to_string(),
             ));
         }
-        let (state, memory_stats) = executable::ExecutableState::reserve(session, plan, inputs)?;
+        let (state, memory_stats) = executable::ExecutableState::prepare(session, plan, inputs)?;
         Ok(Self {
             session,
             representation: plan.representation.clone(),
@@ -140,5 +142,9 @@ impl<'session> AscendExecutable<'session> {
 
     pub fn capture_status(&self) -> &CaptureStatus {
         &self.capture_status
+    }
+
+    pub fn device_info(&self) -> &AscendDeviceInfo {
+        self.session.device_info()
     }
 }
