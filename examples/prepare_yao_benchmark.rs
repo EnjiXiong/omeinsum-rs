@@ -10,6 +10,7 @@ struct Args {
     output: String,
     sc: f64,
     max: usize,
+    opt_profile: String,
     opt_trials: usize,
     opt_iters: usize,
     slice_trials: usize,
@@ -26,6 +27,7 @@ fn args() -> Args {
         output,
         sc: 28.0,
         max: 1 << 24,
+        opt_profile: "fast".into(),
         opt_trials: 1,
         opt_iters: 20,
         slice_trials: 1,
@@ -36,6 +38,7 @@ fn args() -> Args {
         match f.as_str() {
             "--sc-target" => x.sc = v.parse().unwrap(),
             "--max-assignments" => x.max = v.parse().unwrap(),
+            "--optimizer-profile" => x.opt_profile = v,
             "--optimizer-trials" => x.opt_trials = v.parse().unwrap(),
             "--optimizer-iters" => x.opt_iters = v.parse().unwrap(),
             "--slicer-trials" => x.slice_trials = v.parse().unwrap(),
@@ -114,10 +117,14 @@ fn main() {
         });
     }
     let code = EinCode::new(ixs.clone(), iy.clone());
-    let optimizer = TreeSA::fast()
-        .with_ntrials(a.opt_trials)
-        .with_niters(a.opt_iters)
-        .with_sc_target(a.sc);
+    let optimizer = match a.opt_profile.as_str() {
+        "default" => TreeSA::default(),
+        "fast" => TreeSA::fast(),
+        profile => panic!("unknown optimizer profile {profile}"),
+    }
+    .with_ntrials(a.opt_trials)
+    .with_niters(a.opt_iters)
+    .with_sc_target(a.sc);
     let original = optimize_code(&code, &sizes, &optimizer).expect("TreeSA produced no tree");
     let unsliced = contraction_complexity(&original, &sizes, &ixs);
     let slicer = TreeSASlicer::fast()
