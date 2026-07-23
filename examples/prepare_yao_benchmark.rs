@@ -18,6 +18,26 @@ fn parse_label(label: &str) -> usize {
         .unwrap_or_else(|error| panic!("label '{label}' is not a non-negative integer: {error}"))
 }
 
+fn row_major_to_column_major<T: Copy>(data: &[T], shape: &[usize]) -> Vec<T> {
+    assert_eq!(data.len(), shape.iter().product::<usize>());
+    (0..data.len())
+        .map(|mut column_major_index| {
+            let mut coordinates = Vec::with_capacity(shape.len());
+            for &dimension in shape {
+                coordinates.push(column_major_index % dimension);
+                column_major_index /= dimension;
+            }
+            let row_major_index = coordinates
+                .iter()
+                .zip(shape)
+                .fold(0, |index, (&coordinate, &dimension)| {
+                    index * dimension + coordinate
+                });
+            data[row_major_index]
+        })
+        .collect()
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let input = args
@@ -82,12 +102,13 @@ fn main() {
                 "invalid imaginary data length"
             );
             if complex {
-                let data = tensor
+                let row_major = tensor
                     .data_re
                     .iter()
                     .zip(&tensor.data_im)
                     .map(|(&re, &im)| Complex32::new(re as f32, im as f32))
                     .collect::<Vec<_>>();
+                let data = row_major_to_column_major(&row_major, &tensor.shape);
                 let mut shape = tensor.shape.clone();
                 shape.push(2);
                 BenchmarkTensor {
@@ -97,7 +118,14 @@ fn main() {
             } else {
                 BenchmarkTensor {
                     shape: tensor.shape.clone(),
-                    data: tensor.data_re.iter().map(|value| *value as f32).collect(),
+                    data: row_major_to_column_major(
+                        &tensor
+                            .data_re
+                            .iter()
+                            .map(|value| *value as f32)
+                            .collect::<Vec<_>>(),
+                        &tensor.shape,
+                    ),
                 }
             }
         })
@@ -158,4 +186,17 @@ fn main() {
         artifact.complexity.log2_peak_elements,
         artifact.complexity.estimated_peak_bytes_f32
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_major_to_column_major;
+
+    #[test]
+    fn converts_rectangular_matrix_layout() {
+        assert_eq!(
+            row_major_to_column_major(&[0, 1, 2, 3, 4, 5], &[2, 3]),
+            vec![0, 3, 1, 4, 2, 5]
+        );
+    }
 }

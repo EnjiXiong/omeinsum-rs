@@ -80,11 +80,14 @@ fn max_abs_error(expected: &[f32], actual: &[f32]) -> f32 {
 
 fn main() {
     let args = parse_args();
-    let network: BenchmarkNetwork = serde_json::from_reader(BufReader::new(
+    let reader = BufReader::new(
         File::open(&args.path)
             .unwrap_or_else(|error| panic!("failed to open {}: {error}", args.path)),
-    ))
-    .expect("invalid benchmark network JSON");
+    );
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    deserializer.disable_recursion_limit();
+    let network: BenchmarkNetwork =
+        serde::Deserialize::deserialize(&mut deserializer).expect("invalid benchmark network JSON");
     assert_eq!(network.format, "omeinsum-real-f32-benchmark-v1");
     let einsum = network.einsum();
 
