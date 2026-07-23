@@ -1,7 +1,7 @@
 use omeinsum::static_plan::{
-    build_geometry_plan, BinaryContractionTree, ComplexNetwork, ComplexTensor, InputSet,
-    InputTensor, LeafClass, PlanBundle, PlanStats, Plane, Representation, StaticPlan, TensorSpec,
-    ValueId, ValueSpec,
+    build_geometry_plan, build_plan_bundle, BinaryContractionTree, ComplexNetwork, ComplexTensor,
+    InputSet, InputTensor, KernelKind, LeafClass, PlanBundle, PlanStats, Plane, Representation,
+    ScratchRole, StaticPlan, TensorSpec, ValueId, ValueSpec,
 };
 
 fn one_leaf_plan(
@@ -77,6 +77,36 @@ fn canonical_geometry_network(size_dict: Vec<(i32, usize)>) -> ComplexNetwork<f6
                 right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
             }),
             right: Box::new(BinaryContractionTree::Leaf { tensor_index: 2 }),
+        },
+    }
+}
+
+fn two_leaf_scalar_network(left_imag: f64, right_imag: f64) -> ComplexNetwork<f64> {
+    ComplexNetwork {
+        tensors: vec![
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![0],
+                    shape: vec![2],
+                },
+                real: vec![1.0, 2.0],
+                imag: vec![left_imag, 0.0],
+            },
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![0],
+                    shape: vec![2],
+                },
+                real: vec![3.0, 4.0],
+                imag: vec![right_imag, 0.0],
+            },
+        ],
+        output_modes: vec![],
+        size_dict: vec![(0, 2)],
+        tree: BinaryContractionTree::Node {
+            output_modes: vec![],
+            left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
         },
     }
 }
@@ -158,4 +188,192 @@ fn canonical_hashes_are_deterministic_and_cover_node_kinds() {
     let mutated_hash = mutated.recompute_plan_hash().unwrap();
     assert_eq!(mutated.tree_hash, forward.tree_hash);
     assert_ne!(mutated_hash, forward.plan_hash);
+}
+
+#[test]
+fn leaf_classification_uses_inclusive_f64_tolerance_and_rejects_nonfinite() {
+    let source = two_leaf_scalar_network(0.0, 0.0);
+    let mut network = ComplexNetwork {
+        tensors: vec![
+            ComplexTensor {
+                imag: vec![1e-12 - 1e-16, 0.0],
+                ..source.tensors[0].clone()
+            },
+            ComplexTensor {
+                imag: vec![1e-12, 0.0],
+                ..source.tensors[0].clone()
+            },
+            ComplexTensor {
+                imag: vec![1e-12 + 1e-16, 0.0],
+                ..source.tensors[0].clone()
+            },
+        ],
+        output_modes: vec![],
+        size_dict: vec![(0, 2)],
+        tree: BinaryContractionTree::Node {
+            output_modes: vec![],
+            left: Box::new(BinaryContractionTree::Node {
+                output_modes: vec![0],
+                left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+                right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
+            }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 2 }),
+        },
+    };
+
+    let bundle = build_plan_bundle(&network, 1e-12).unwrap();
+    assert_eq!(
+        bundle
+            .inputs
+            .tensors
+            .iter()
+            .map(|tensor| tensor.class.clone())
+            .collect::<Vec<_>>(),
+        vec![LeafClass::Real, LeafClass::Real, LeafClass::Complex]
+    );
+    assert!(bundle.inputs.tensors[0]
+        .imag
+        .iter()
+        .all(|value| *value == 0.0));
+    assert!(bundle.inputs.tensors[1]
+        .imag
+        .iter()
+        .all(|value| *value == 0.0));
+    assert_eq!(bundle.inputs.tensors[2].imag_max, 1e-12 + 1e-16);
+
+    network.tensors[1].real[0] = f64::INFINITY;
+    assert!(build_plan_bundle(&network, 1e-12).is_err());
+}
+
+#[test]
+fn selective_transitions_and_scratch_roles_are_frozen() {
+    let cases = [
+        (0.0, 0.0, KernelKind::RealReal, vec![Plane::Real]),
+        (
+            1.0,
+            0.0,
+            KernelKind::RideLeft,
+            vec![Plane::Real, Plane::Imag],
+        ),
+        (
+            0.0,
+            1.0,
+            KernelKind::RideRight,
+            vec![Plane::Real, Plane::Imag],
+        ),
+        (
+            1.0,
+            1.0,
+            KernelKind::Merge3M,
+            vec![Plane::Real, Plane::Imag],
+        ),
+    ];
+
+    for (left_imag, right_imag, expected_kind, expected_planes) in cases {
+        let bundle =
+            build_plan_bundle(&two_leaf_scalar_network(left_imag, right_imag), 1e-12).unwrap();
+        let node = &bundle.realified_rank3.nodes[0];
+        assert_eq!(node.kind, expected_kind);
+        assert_eq!(
+            bundle.realified_rank3.values[node.output.0].planes,
+            expected_planes
+        );
+        let expected_scratch = if expected_kind == KernelKind::Merge3M {
+            vec![
+                ScratchRole::LeftSum,
+                ScratchRole::RightSum,
+                ScratchRole::Product1,
+                ScratchRole::Product2,
+                ScratchRole::Product3,
+            ]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            node.scratch
+                .iter()
+                .map(|scratch| scratch.role.clone())
+                .collect::<Vec<_>>(),
+            expected_scratch
+        );
+        assert_eq!(
+            bundle.flat_4m.nodes[0]
+                .scratch
+                .iter()
+                .map(|scratch| scratch.role.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ScratchRole::Product1,
+                ScratchRole::Product2,
+                ScratchRole::Product3,
+                ScratchRole::Product4,
+            ]
+        );
+    }
+}
+
+#[test]
+fn plan_accounting_invariants_and_validation_hold() {
+    let mut network = two_leaf_scalar_network(1.0, 0.0);
+    network
+        .tensors
+        .extend(two_leaf_scalar_network(0.0, 1.0).tensors);
+    network.tree = BinaryContractionTree::Node {
+        output_modes: vec![],
+        left: Box::new(BinaryContractionTree::Node {
+            output_modes: vec![0],
+            left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
+        }),
+        right: Box::new(BinaryContractionTree::Node {
+            output_modes: vec![0],
+            left: Box::new(BinaryContractionTree::Leaf { tensor_index: 2 }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 3 }),
+        }),
+    };
+
+    let bundle = build_plan_bundle(&network, 1e-12).unwrap();
+    bundle.validate().unwrap();
+    let stats = &bundle.realified_rank3.stats;
+    let cost = stats.realification_cost.as_ref().unwrap();
+    assert_eq!(
+        stats.merge_3m_nodes,
+        stats.complex_leaf_count.saturating_sub(1)
+    );
+    assert!(
+        (cost.real_real_fraction + cost.ride_fraction + cost.merge_fraction - 1.0).abs() < 1e-15
+    );
+    assert_eq!(
+        cost.predicted_arithmetic_overhead,
+        1.0 + cost.ride_fraction + 2.0 * cost.merge_fraction
+    );
+    assert_eq!(
+        stats.real_matmul_volume,
+        cost.real_real_volume + 2 * cost.ride_volume + 3 * cost.merge_volume
+    );
+    assert_eq!(
+        bundle.flat_4m.stats.real_matmul_volume,
+        4 * bundle.flat_4m.stats.real_skeleton_volume
+    );
+    assert!(bundle.real_skeleton.stats.realification_cost.is_none());
+    assert!(bundle.flat_4m.stats.realification_cost.is_none());
+
+    let mut mutated = bundle;
+    mutated.realified_rank3.nodes[0].kind = KernelKind::Flat4M;
+    assert!(mutated.validate().is_err());
+
+    let leaf_only = ComplexNetwork {
+        tensors: vec![ComplexTensor {
+            spec: TensorSpec {
+                modes: vec![],
+                shape: vec![],
+            },
+            real: vec![1.0],
+            imag: vec![0.0],
+        }],
+        output_modes: vec![],
+        size_dict: vec![],
+        tree: BinaryContractionTree::Leaf { tensor_index: 0 },
+    };
+    assert!(build_plan_bundle(&leaf_only, 1e-12).is_err());
 }
