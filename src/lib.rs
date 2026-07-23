@@ -8,7 +8,7 @@
 //! - **Optimized contraction**: Integration with [omeco](https://github.com/GiggleLiu/omeco) for contraction order optimization
 //! - **Backpropagation**: Gradient computation for both tropical and standard operations
 //! - **Zero-copy views**: Stride-based tensor with efficient permute/reshape
-//! - **CPU + CUDA**: Support for both backends (CUDA optional)
+//! - **CPU + accelerators**: Optional CUDA and native Ascend execution
 //!
 //! ## Quick Start
 //!
@@ -76,6 +76,9 @@ pub use tensor::{Tensor, TensorView};
 
 #[cfg(feature = "tropical")]
 pub use algebra::{MaxMul, MaxPlus, MinPlus};
+
+#[cfg(feature = "ascend")]
+pub use backend::ascend;
 
 #[cfg(any(feature = "cuda", feature = "cuda-tropical"))]
 pub use backend::Cuda;

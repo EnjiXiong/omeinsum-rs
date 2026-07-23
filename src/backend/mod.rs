@@ -11,6 +11,9 @@ mod traits;
 pub use cpu::Cpu;
 pub use traits::{Backend, BackendScalar, Storage};
 
+#[cfg(feature = "ascend")]
+pub mod ascend;
+
 #[cfg(any(feature = "cuda", feature = "cuda-tropical"))]
 mod cuda;
 

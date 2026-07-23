@@ -1,5 +1,8 @@
 // build.rs
 fn main() {
+    #[cfg(feature = "ascend")]
+    build_ascend();
+
     #[cfg(feature = "cuda")]
     {
         // Print version requirement warning
@@ -45,5 +48,78 @@ fn main() {
                 lib_path
             );
         }
+    }
+}
+
+#[cfg(feature = "ascend")]
+fn build_ascend() {
+    use std::path::{Path, PathBuf};
+
+    println!("cargo:rerun-if-env-changed=ASCEND_HOME_PATH");
+    println!("cargo:rerun-if-env-changed=OME_ASCEND_ENABLE_CAPTURE");
+    println!("cargo:rerun-if-changed=native/ascend/ome_ascend.h");
+    println!("cargo:rerun-if-changed=native/ascend/ome_ascend.cpp");
+
+    let root = std::env::var_os("ASCEND_HOME_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!("feature `ascend` requires ASCEND_HOME_PATH to point to a CANN installation")
+        });
+    let include = root.join("include");
+    for relative in [
+        "acl/acl.h",
+        "aclnnop/aclnn_matmul.h",
+        "aclnnop/aclnn_add.h",
+        "aclnnop/aclnn_sub.h",
+        "aclnnop/aclnn_permute.h",
+    ] {
+        let header = include.join(relative);
+        if !header.is_file() {
+            panic!("required CANN header is missing: {}", header.display());
+        }
+    }
+
+    let target_arch =
+        std::env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo must provide CARGO_CFG_TARGET_ARCH");
+    let candidates = [
+        root.join("lib64"),
+        root.join(format!("{target_arch}-linux/lib64")),
+    ];
+    let library_dir = candidates
+        .iter()
+        .find(|directory| {
+            has_shared_library(directory, "ascendcl") && has_shared_library(directory, "nnopbase")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no CANN library directory contains both libascendcl.so and \
+                 libnnopbase.so; searched {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++17")
+        .include(&include)
+        .include("native/ascend")
+        .file("native/ascend/ome_ascend.cpp")
+        .warnings(true);
+    if std::env::var("OME_ASCEND_ENABLE_CAPTURE").as_deref() == Ok("1") {
+        build.define("OME_ASCEND_ENABLE_CAPTURE", "1");
+    }
+    build.compile("ome_ascend");
+
+    println!("cargo:rustc-link-search=native={}", library_dir.display());
+    println!("cargo:rustc-link-lib=dylib=ascendcl");
+    println!("cargo:rustc-link-lib=dylib=nnopbase");
+
+    fn has_shared_library(directory: &Path, stem: &str) -> bool {
+        directory.join(format!("lib{stem}.so")).is_file()
     }
 }

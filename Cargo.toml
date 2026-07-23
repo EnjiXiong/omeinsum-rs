@@ -58,6 +58,9 @@ rayon = { version = "1.8", optional = true }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[build-dependencies]
+cc = "1"
+
 [features]
 # Default: minimal, just Standard algebra
 default = []
@@ -74,6 +77,9 @@ parallel = ["rayon"]
 # CUDA backend for standard algebra via cuTENSOR (requires cuTENSOR 2.0+, see
 # package.metadata.native-deps).
 cuda = ["dep:cudarc"]
+
+# Native Float32 execution through AscendCL and ACLNN.
+ascend = []
 
 # Tropical contractions on GPU via tropical-gemm-cuda. Independent of cuTENSOR:
 # brings the cudarc device/storage layer + the tropical GPU kernels, so it builds
