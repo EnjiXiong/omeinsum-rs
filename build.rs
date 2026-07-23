@@ -113,6 +113,9 @@ fn build_ascend() {
     if std::env::var("OME_ASCEND_ENABLE_CAPTURE").as_deref() == Ok("1") {
         build.define("OME_ASCEND_ENABLE_CAPTURE", "1");
     }
+    if std::env::var("DEBUG").as_deref() == Ok("true") {
+        build.define("OME_ASCEND_DEBUG_DIAGNOSTICS", "1");
+    }
     build.compile("ome_ascend");
 
     println!("cargo:rustc-link-search=native={}", library_dir.display());

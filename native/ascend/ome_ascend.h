@@ -77,6 +77,13 @@ ome_ascend_status_t ome_ascend_capture_run(
     ome_ascend_context_t *context, ome_ascend_capture_t *capture);
 void ome_ascend_capture_destroy(ome_ascend_capture_t *capture);
 
+#ifdef OME_ASCEND_DEBUG_DIAGNOSTICS
+void ome_ascend_debug_reset_counts(void);
+uint64_t ome_ascend_debug_descriptor_creations(void);
+uint64_t ome_ascend_debug_workspace_queries(void);
+uint64_t ome_ascend_debug_op_runs(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

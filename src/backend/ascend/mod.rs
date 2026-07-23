@@ -6,6 +6,7 @@ pub mod context;
 mod error;
 pub(crate) mod executable;
 pub(crate) mod ffi;
+pub(crate) mod operator;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::static_plan::{ExecutionError, InputSet, Representation, StaticPlan};
 
 use context::Context;
+pub use operator::{run_matmul_smoke, AscendMatmulSmokeReport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

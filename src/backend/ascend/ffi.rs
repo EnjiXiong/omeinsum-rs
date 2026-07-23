@@ -119,4 +119,13 @@ unsafe extern "C" {
     pub(crate) fn ome_ascend_capture_end(context: *mut Context, out: *mut *mut Capture) -> Status;
     pub(crate) fn ome_ascend_capture_run(context: *mut Context, capture: *mut Capture) -> Status;
     pub(crate) fn ome_ascend_capture_destroy(capture: *mut Capture);
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn ome_ascend_debug_reset_counts();
+    #[cfg(debug_assertions)]
+    pub(crate) fn ome_ascend_debug_descriptor_creations() -> u64;
+    #[cfg(debug_assertions)]
+    pub(crate) fn ome_ascend_debug_workspace_queries() -> u64;
+    #[cfg(debug_assertions)]
+    pub(crate) fn ome_ascend_debug_op_runs() -> u64;
 }

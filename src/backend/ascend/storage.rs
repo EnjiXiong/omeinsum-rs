@@ -172,10 +172,12 @@ impl<'context> DeviceBuffer<'context> {
             )
         })?;
         Ok(TensorDescriptor {
-            raw,
-            shape: shape.to_vec(),
-            strides: strides.to_vec(),
-            _buffer: Rc::clone(&self.inner),
+            inner: Rc::new(TensorInner {
+                raw,
+                shape: shape.to_vec(),
+                strides: strides.to_vec(),
+                _buffer: Rc::clone(&self.inner),
+            }),
         })
     }
 
@@ -222,28 +224,40 @@ impl<'context> DeviceBuffer<'context> {
     }
 }
 
-pub struct TensorDescriptor<'context> {
+struct TensorInner<'context> {
     raw: NonNull<ffi::Tensor>,
     shape: Vec<usize>,
     strides: Vec<i64>,
     _buffer: Rc<BufferInner<'context>>,
 }
 
-impl TensorDescriptor<'_> {
-    pub fn shape(&self) -> &[usize] {
-        &self.shape
-    }
+pub struct TensorDescriptor<'context> {
+    inner: Rc<TensorInner<'context>>,
+}
 
-    pub fn strides(&self) -> &[i64] {
-        &self.strides
-    }
-
-    pub(crate) fn raw(&self) -> *mut ffi::Tensor {
-        self.raw.as_ptr()
+impl Clone for TensorDescriptor<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
     }
 }
 
-impl Drop for TensorDescriptor<'_> {
+impl TensorDescriptor<'_> {
+    pub fn shape(&self) -> &[usize] {
+        &self.inner.shape
+    }
+
+    pub fn strides(&self) -> &[i64] {
+        &self.inner.strides
+    }
+
+    pub(crate) fn raw(&self) -> *mut ffi::Tensor {
+        self.inner.raw.as_ptr()
+    }
+}
+
+impl Drop for TensorInner<'_> {
     fn drop(&mut self) {
         unsafe { ffi::ome_ascend_tensor_destroy(self.raw.as_ptr()) };
     }

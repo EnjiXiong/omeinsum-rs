@@ -17,6 +17,12 @@
 namespace {
 thread_local std::string last_error;
 
+#ifdef OME_ASCEND_DEBUG_DIAGNOSTICS
+thread_local uint64_t descriptor_creations = 0;
+thread_local uint64_t workspace_queries = 0;
+thread_local uint64_t op_runs = 0;
+#endif
+
 enum StatusCategory : int32_t {
     kSuccess = 0,
     kInvalidArgument = 1,
@@ -87,6 +93,22 @@ struct ome_ascend_buffer {
 
 struct ome_ascend_tensor {
     aclTensor *tensor = nullptr;
+};
+
+enum class OpKind {
+    kMatmul,
+    kAdd,
+    kSub,
+    kPermute,
+};
+
+struct ome_ascend_op {
+    OpKind kind = OpKind::kMatmul;
+    aclOpExecutor *executor = nullptr;
+    aclScalar *scalar = nullptr;
+    aclIntArray *int_array = nullptr;
+    float alpha = 1.0F;
+    uint64_t workspace_bytes = 0;
 };
 
 namespace {
@@ -347,6 +369,9 @@ extern "C" ome_ascend_status_t ome_ascend_tensor_f32(
             return error(kAclnn, -1, "aclCreateTensor",
                          "returned a null descriptor");
         }
+#ifdef OME_ASCEND_DEBUG_DIAGNOSTICS
+        ++descriptor_creations;
+#endif
         *out = descriptor.release();
         return ok();
     });
@@ -362,3 +387,232 @@ extern "C" void ome_ascend_tensor_destroy(
     } catch (...) {
     }
 }
+
+namespace {
+void cleanup_op(ome_ascend_op *op) noexcept {
+    if (op == nullptr) {
+        return;
+    }
+    if (op->executor != nullptr) {
+        (void)aclDestroyAclOpExecutor(op->executor);
+        op->executor = nullptr;
+    }
+    if (op->scalar != nullptr) {
+        (void)aclDestroyScalar(op->scalar);
+        op->scalar = nullptr;
+    }
+    if (op->int_array != nullptr) {
+        (void)aclDestroyIntArray(op->int_array);
+        op->int_array = nullptr;
+    }
+}
+
+ome_ascend_status_t finalize_prepared_op(
+    std::unique_ptr<ome_ascend_op> op, aclnnStatus query_status,
+    const char *query_operation, ome_ascend_op_t **out) {
+#ifdef OME_ASCEND_DEBUG_DIAGNOSTICS
+    ++workspace_queries;
+#endif
+    if (query_status != 0) {
+        const auto status =
+            error(kAclnn, query_status, query_operation);
+        cleanup_op(op.get());
+        return status;
+    }
+    const aclnnStatus repeatable_status =
+        aclSetAclOpExecutorRepeatable(op->executor);
+    if (repeatable_status != 0) {
+        const auto status = error(kAclnn, repeatable_status,
+                                  "aclSetAclOpExecutorRepeatable");
+        cleanup_op(op.get());
+        return status;
+    }
+    *out = op.release();
+    return ok();
+}
+
+bool valid_prepare_arguments(
+    ome_ascend_context_t *context, const ome_ascend_tensor_t *left,
+    const ome_ascend_tensor_t *right, ome_ascend_tensor_t *output,
+    ome_ascend_op_t **out) {
+    return context != nullptr && left != nullptr && left->tensor != nullptr &&
+           right != nullptr && right->tensor != nullptr && output != nullptr &&
+           output->tensor != nullptr && out != nullptr;
+}
+}
+
+extern "C" ome_ascend_status_t ome_ascend_prepare_matmul(
+    ome_ascend_context_t *context, const ome_ascend_tensor_t *left,
+    const ome_ascend_tensor_t *right, ome_ascend_tensor_t *output,
+    int8_t cube_math_type, ome_ascend_op_t **out) {
+    return guarded("ome_ascend_prepare_matmul", [&]() {
+        if (!valid_prepare_arguments(context, left, right, output, out)) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_prepare_matmul",
+                         "invalid null argument");
+        }
+        if (cube_math_type != 0) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_prepare_matmul",
+                         "only cubeMathType=0 KEEP_DTYPE is supported");
+        }
+        *out = nullptr;
+        auto op = std::make_unique<ome_ascend_op>();
+        op->kind = OpKind::kMatmul;
+        const aclnnStatus status = aclnnMatmulGetWorkspaceSize(
+            left->tensor, right->tensor, output->tensor, cube_math_type,
+            &op->workspace_bytes, &op->executor);
+        return finalize_prepared_op(std::move(op), status,
+                                    "aclnnMatmulGetWorkspaceSize", out);
+    });
+}
+
+extern "C" ome_ascend_status_t ome_ascend_prepare_add(
+    ome_ascend_context_t *context, const ome_ascend_tensor_t *left,
+    const ome_ascend_tensor_t *right, ome_ascend_tensor_t *output,
+    ome_ascend_op_t **out) {
+    return guarded("ome_ascend_prepare_add", [&]() {
+        if (!valid_prepare_arguments(context, left, right, output, out)) {
+            return error(kInvalidArgument, -1, "ome_ascend_prepare_add",
+                         "invalid null argument");
+        }
+        *out = nullptr;
+        auto op = std::make_unique<ome_ascend_op>();
+        op->kind = OpKind::kAdd;
+        op->scalar = aclCreateScalar(&op->alpha, ACL_FLOAT);
+        if (op->scalar == nullptr) {
+            return error(kAclnn, -1, "aclCreateScalar",
+                         "returned a null scalar");
+        }
+        const aclnnStatus status = aclnnAddGetWorkspaceSize(
+            left->tensor, right->tensor, op->scalar, output->tensor,
+            &op->workspace_bytes, &op->executor);
+        return finalize_prepared_op(std::move(op), status,
+                                    "aclnnAddGetWorkspaceSize", out);
+    });
+}
+
+extern "C" ome_ascend_status_t ome_ascend_prepare_sub(
+    ome_ascend_context_t *context, const ome_ascend_tensor_t *left,
+    const ome_ascend_tensor_t *right, ome_ascend_tensor_t *output,
+    ome_ascend_op_t **out) {
+    return guarded("ome_ascend_prepare_sub", [&]() {
+        if (!valid_prepare_arguments(context, left, right, output, out)) {
+            return error(kInvalidArgument, -1, "ome_ascend_prepare_sub",
+                         "invalid null argument");
+        }
+        *out = nullptr;
+        auto op = std::make_unique<ome_ascend_op>();
+        op->kind = OpKind::kSub;
+        op->scalar = aclCreateScalar(&op->alpha, ACL_FLOAT);
+        if (op->scalar == nullptr) {
+            return error(kAclnn, -1, "aclCreateScalar",
+                         "returned a null scalar");
+        }
+        const aclnnStatus status = aclnnSubGetWorkspaceSize(
+            left->tensor, right->tensor, op->scalar, output->tensor,
+            &op->workspace_bytes, &op->executor);
+        return finalize_prepared_op(std::move(op), status,
+                                    "aclnnSubGetWorkspaceSize", out);
+    });
+}
+
+extern "C" ome_ascend_status_t ome_ascend_prepare_permute(
+    ome_ascend_context_t *context, const ome_ascend_tensor_t *input,
+    const int64_t *axes, uint64_t rank, ome_ascend_tensor_t *output,
+    ome_ascend_op_t **out) {
+    return guarded("ome_ascend_prepare_permute", [&]() {
+        if (context == nullptr || input == nullptr ||
+            input->tensor == nullptr || (rank > 0 && axes == nullptr) ||
+            output == nullptr || output->tensor == nullptr || out == nullptr) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_prepare_permute",
+                         "invalid null argument");
+        }
+        *out = nullptr;
+        auto op = std::make_unique<ome_ascend_op>();
+        op->kind = OpKind::kPermute;
+        op->int_array = aclCreateIntArray(axes, rank);
+        if (op->int_array == nullptr) {
+            return error(kAclnn, -1, "aclCreateIntArray",
+                         "returned a null array");
+        }
+        const aclnnStatus status = aclnnPermuteGetWorkspaceSize(
+            input->tensor, op->int_array, output->tensor,
+            &op->workspace_bytes, &op->executor);
+        return finalize_prepared_op(std::move(op), status,
+                                    "aclnnPermuteGetWorkspaceSize", out);
+    });
+}
+
+extern "C" uint64_t ome_ascend_op_workspace_bytes(
+    const ome_ascend_op_t *op) {
+    return op == nullptr ? 0 : op->workspace_bytes;
+}
+
+extern "C" ome_ascend_status_t ome_ascend_op_run(
+    ome_ascend_context_t *context, ome_ascend_op_t *op,
+    ome_ascend_buffer_t *workspace) {
+    return guarded("ome_ascend_op_run", [&]() {
+        if (context == nullptr || op == nullptr || op->executor == nullptr ||
+            workspace == nullptr || workspace->bytes < op->workspace_bytes) {
+            return error(kInvalidArgument, -1, "ome_ascend_op_run",
+                         "invalid context, op, or workspace");
+        }
+        void *workspace_address =
+            op->workspace_bytes == 0 ? nullptr : workspace->device;
+        aclnnStatus status = 0;
+        switch (op->kind) {
+            case OpKind::kMatmul:
+                status = aclnnMatmul(workspace_address, op->workspace_bytes,
+                                     op->executor, context->stream);
+                break;
+            case OpKind::kAdd:
+                status = aclnnAdd(workspace_address, op->workspace_bytes,
+                                  op->executor, context->stream);
+                break;
+            case OpKind::kSub:
+                status = aclnnSub(workspace_address, op->workspace_bytes,
+                                  op->executor, context->stream);
+                break;
+            case OpKind::kPermute:
+                status = aclnnPermute(workspace_address, op->workspace_bytes,
+                                      op->executor, context->stream);
+                break;
+        }
+#ifdef OME_ASCEND_DEBUG_DIAGNOSTICS
+        ++op_runs;
+#endif
+        return status == 0
+                   ? ok()
+                   : error(kAclnn, status, "ACLNN second-stage execution");
+    });
+}
+
+extern "C" void ome_ascend_op_destroy(ome_ascend_op_t *op) {
+    try {
+        cleanup_op(op);
+        delete op;
+    } catch (...) {
+    }
+}
+
+#ifdef OME_ASCEND_DEBUG_DIAGNOSTICS
+extern "C" void ome_ascend_debug_reset_counts(void) {
+    descriptor_creations = 0;
+    workspace_queries = 0;
+    op_runs = 0;
+}
+
+extern "C" uint64_t ome_ascend_debug_descriptor_creations(void) {
+    return descriptor_creations;
+}
+
+extern "C" uint64_t ome_ascend_debug_workspace_queries(void) {
+    return workspace_queries;
+}
+
+extern "C" uint64_t ome_ascend_debug_op_runs(void) {
+    return op_runs;
+}
+#endif
