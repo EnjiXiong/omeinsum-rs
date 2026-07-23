@@ -1,5 +1,5 @@
 use omeinsum::static_plan::{
-    build_geometry_plan, build_plan_bundle, prepare_cpu_f32, prepare_cpu_f64,
+    build_geometry_plan, build_plan_bundle, contract_complex64, prepare_cpu_f32, prepare_cpu_f64,
     BinaryContractionTree, ComplexNetwork, ComplexTensor, InputSet, InputTensor, KernelKind,
     LeafClass, PlanBundle, PlanStats, Plane, Representation, ScratchRole, StaticPlan, TensorSpec,
     ValueId, ValueSpec,
@@ -664,5 +664,55 @@ fn cpu_frozen_geometry_honors_operand_and_output_permutations() {
         let actual = executable.output().unwrap();
         let error = (num_complex::Complex64::new(actual.re, actual.im) - reference).norm();
         assert!(error <= 1e-12 + 1e-9 * reference.norm());
+    }
+}
+
+#[test]
+fn complex_reference_preserves_supplied_floating_point_postorder() {
+    let tensor = |value| ComplexTensor {
+        spec: TensorSpec {
+            modes: vec![0],
+            shape: vec![1],
+        },
+        real: vec![value],
+        imag: vec![0.0],
+    };
+    let mut left_associative = ComplexNetwork {
+        tensors: vec![tensor(1e308), tensor(1e-308), tensor(1e-308)],
+        output_modes: vec![],
+        size_dict: vec![(0, 1)],
+        tree: vector_chain_tree(3),
+    };
+    let left_bundle = build_plan_bundle(&left_associative, 1e-12).unwrap();
+    let left = contract_complex64(&left_bundle.realified_rank3, &left_bundle.inputs).unwrap();
+
+    left_associative.tree = BinaryContractionTree::Node {
+        output_modes: vec![],
+        left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+        right: Box::new(BinaryContractionTree::Node {
+            output_modes: vec![0],
+            left: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 2 }),
+        }),
+    };
+    let right_bundle = build_plan_bundle(&left_associative, 1e-12).unwrap();
+    let right = contract_complex64(&right_bundle.realified_rank3, &right_bundle.inputs).unwrap();
+
+    assert!(left.re > 0.0);
+    assert_eq!(right.re, 0.0);
+    assert_ne!(left, right);
+}
+
+#[test]
+fn complex_reference_matches_two_leaf_flat_and_selective_results() {
+    let bundle = build_plan_bundle(&two_leaf_scalar_network(0.25, -0.5), 1e-12).unwrap();
+    let reference = contract_complex64(&bundle.realified_rank3, &bundle.inputs).unwrap();
+    for plan in [&bundle.flat_4m, &bundle.realified_rank3] {
+        let mut executable = prepare_cpu_f64(plan, &bundle.inputs).unwrap();
+        executable.enqueue().unwrap();
+        executable.synchronize().unwrap();
+        let actual = executable.output().unwrap();
+        assert!((actual.re - reference.re).abs() <= 1e-12);
+        assert!((actual.im - reference.im).abs() <= 1e-12);
     }
 }

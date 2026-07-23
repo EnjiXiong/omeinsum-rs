@@ -1,11 +1,13 @@
 #![allow(clippy::result_large_err)] // Public execution APIs use the frozen diagnostic schema.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Add, Mul, Sub};
 
 use num_traits::{One, Zero};
+use omeco::{EinCode, NestedEinsum};
 
-use crate::algebra::{Algebra, Scalar, Standard};
-use crate::{BackendScalar, Cpu, Tensor};
+use crate::algebra::{Algebra, Complex64, Scalar, Standard};
+use crate::{BackendScalar, Cpu, Einsum, Tensor};
 
 use super::{
     ComplexValue, ExecutionError, InputSet, KernelKind, PlanNode, Plane, PreparedExecutable,
@@ -24,6 +26,118 @@ pub fn prepare_cpu_f32(
     inputs: &InputSet<f64>,
 ) -> Result<Box<dyn PreparedExecutable>, ExecutionError> {
     Ok(Box::new(CpuExecutable::<f32>::prepare(plan, inputs)?))
+}
+
+pub fn contract_complex64(
+    plan: &StaticPlan,
+    inputs: &InputSet<f64>,
+) -> Result<ComplexValue, ExecutionError> {
+    plan.validate()
+        .map_err(|error| ExecutionError::InvalidPlan(error.to_string()))?;
+    if plan.leaf_values.len() != inputs.tensors.len() {
+        return Err(ExecutionError::InvalidPlan(format!(
+            "plan has {} leaves but input set has {} tensors",
+            plan.leaf_values.len(),
+            inputs.tensors.len()
+        )));
+    }
+
+    let labels: BTreeSet<_> = plan
+        .values
+        .iter()
+        .flat_map(|value| value.tensor.modes.iter().copied())
+        .collect();
+    let label_map: BTreeMap<_, _> = labels
+        .into_iter()
+        .enumerate()
+        .map(|(dense, source)| (source, dense))
+        .collect();
+    let map_modes = |modes: &[i32]| {
+        modes
+            .iter()
+            .map(|mode| {
+                label_map.get(mode).copied().ok_or_else(|| {
+                    ExecutionError::InvalidPlan(format!("mode {mode} is missing from label map"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+
+    let mut tensors = Vec::with_capacity(inputs.tensors.len());
+    let mut input_indices = Vec::with_capacity(inputs.tensors.len());
+    let mut size_dict = HashMap::new();
+    for (index, (input, value_id)) in inputs.tensors.iter().zip(&plan.leaf_values).enumerate() {
+        let value = &plan.values[value_id.0];
+        if input.spec != value.tensor || input.real.len() != input.imag.len() {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "input tensor {index} does not match plan leaf"
+            )));
+        }
+        let data = input
+            .real
+            .iter()
+            .zip(&input.imag)
+            .map(|(real, imag)| Complex64::new(*real, *imag))
+            .collect::<Vec<_>>();
+        tensors.push(Tensor::<Complex64, Cpu>::from_data(
+            &data,
+            &input.spec.shape,
+        ));
+        input_indices.push(map_modes(&input.spec.modes)?);
+        for (mode, dimension) in input.spec.modes.iter().zip(&input.spec.shape) {
+            let dense = label_map[mode];
+            if let Some(previous) = size_dict.insert(dense, *dimension) {
+                if previous != *dimension {
+                    return Err(ExecutionError::InvalidPlan(format!(
+                        "mode {mode} has inconsistent dimensions"
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut trees: Vec<Option<NestedEinsum<usize>>> = vec![None; plan.values.len()];
+    for (tensor_index, value_id) in plan.leaf_values.iter().enumerate() {
+        trees[value_id.0] = Some(NestedEinsum::leaf(tensor_index));
+    }
+    for node in &plan.nodes {
+        let left = trees[node.left.0].clone().ok_or_else(|| {
+            ExecutionError::InvalidPlan(format!("node {} left subtree is unavailable", node.id))
+        })?;
+        let right = trees[node.right.0].clone().ok_or_else(|| {
+            ExecutionError::InvalidPlan(format!("node {} right subtree is unavailable", node.id))
+        })?;
+        let eins = EinCode::new(
+            vec![
+                map_modes(&plan.values[node.left.0].tensor.modes)?,
+                map_modes(&plan.values[node.right.0].tensor.modes)?,
+            ],
+            map_modes(&plan.values[node.output.0].tensor.modes)?,
+        );
+        trees[node.output.0] = Some(NestedEinsum::node(vec![left, right], eins));
+    }
+    let tree = trees[plan.output.0].clone().ok_or_else(|| {
+        ExecutionError::InvalidPlan("plan topology has no unique output tree".to_string())
+    })?;
+    let output_indices = map_modes(&plan.values[plan.output.0].tensor.modes)?;
+    let mut einsum = Einsum::new(input_indices, output_indices, size_dict);
+    einsum.set_contraction_tree(tree);
+    let references: Vec<_> = tensors.iter().collect();
+    let output = einsum.execute::<Standard<Complex64>, _, _>(&references);
+    if !output.shape().is_empty() || output.numel() != 1 {
+        return Err(ExecutionError::InvalidPlan(
+            "complex fixed-tree reference did not produce a scalar".to_string(),
+        ));
+    }
+    let value = output.to_vec()[0];
+    let value = ComplexValue {
+        re: value.re,
+        im: value.im,
+    };
+    if !value.re.is_finite() || !value.im.is_finite() {
+        return Err(ExecutionError::NonFiniteOutput(value));
+    }
+    Ok(value)
 }
 
 trait CpuReal:
