@@ -1,6 +1,6 @@
 use omeinsum::backend::ascend::{
     AscendExecutable, AscendExecutableConfig, AscendExecutionMode, AscendPrecisionMode,
-    AscendSession, AscendSessionConfig,
+    AscendSession, AscendSessionConfig, CaptureStatus,
 };
 use omeinsum::static_plan::{
     build_plan_bundle, prepare_cpu_f32, BinaryContractionTree, ComplexNetwork, ComplexTensor,
@@ -90,4 +90,54 @@ fn ascend_static_plan_conformance_real_ride_merge_and_flat() {
     let merge = build_plan_bundle(&two_leaf_network(0.25, -0.5), 1e-12).unwrap();
     compare_plan(&session, &merge.realified_rank3, &merge.inputs);
     compare_plan(&session, &merge.flat_4m, &merge.inputs);
+}
+
+#[test]
+#[ignore = "requires a live Ascend device, CANN runtime, and OME_ASCEND_ENABLE_CAPTURE=1"]
+fn ascend_captured_rank3_matches_repeatable() {
+    let device_id = std::env::var("OME_ASCEND_TEST_DEVICE_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let session = AscendSession::new(&AscendSessionConfig {
+        device_id,
+        precision_mode: AscendPrecisionMode::KeepDtype,
+    })
+    .unwrap();
+    let bundle = build_plan_bundle(&two_leaf_network(0.25, -0.5), 1e-12).unwrap();
+
+    let mut repeatable = AscendExecutable::prepare(
+        &session,
+        &bundle.realified_rank3,
+        &bundle.inputs,
+        &AscendExecutableConfig {
+            execution_mode: AscendExecutionMode::RepeatableAclnn,
+        },
+    )
+    .unwrap();
+    let mut captured = AscendExecutable::prepare(
+        &session,
+        &bundle.realified_rank3,
+        &bundle.inputs,
+        &AscendExecutableConfig {
+            execution_mode: AscendExecutionMode::CapturedModel,
+        },
+    )
+    .unwrap();
+    assert_eq!(captured.capture_status(), &CaptureStatus::Ready);
+
+    repeatable.enqueue().unwrap();
+    repeatable.synchronize().unwrap();
+    let expected = repeatable.output().unwrap();
+    captured.enqueue().unwrap();
+    captured.synchronize().unwrap();
+    let actual = captured.output().unwrap();
+    let scale = 1.0f64.max(expected.re.abs()).max(expected.im.abs());
+    let error =
+        ((actual.re - expected.re).powi(2) + (actual.im - expected.im).powi(2)).sqrt() / scale;
+    assert!(
+        error <= 1e-3,
+        "captured rank-3 output differs from repeatable: expected {expected:?}, \
+         actual {actual:?}, scaled error {error}"
+    );
 }

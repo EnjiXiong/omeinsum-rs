@@ -5,9 +5,10 @@ use crate::static_plan::{
     InputSet, KernelKind, PreparedExecutable, ScratchRole, StaticPlan, TensorSpec,
 };
 
+use super::capture::{configure_capture, Capture, CaptureAttempt, CaptureRuntime};
 use super::operator::{PreparedOp, PreparedStep};
 use super::storage::{DeviceBuffer, TensorDescriptor};
-use super::{AscendMemoryStats, AscendPhaseTimings, AscendSession};
+use super::{AscendMemoryStats, AscendPhaseTimings, AscendSession, CaptureStatus};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub(crate) struct ExecutableState<'session> {
     output_elements: usize,
     context: &'session super::context::Context,
     pub(crate) phase_timings: AscendPhaseTimings,
+    capture: Option<Capture<'session>>,
 }
 
 impl<'session> ExecutableState<'session> {
@@ -176,16 +178,44 @@ impl<'session> ExecutableState<'session> {
                     warmup_seconds: 0.0,
                     d2h_seconds: 0.0,
                 },
+                capture: None,
             },
             stats,
         ))
     }
 
     pub(crate) fn enqueue(&mut self) -> Result<(), ExecutionError> {
+        if let Some(capture) = &mut self.capture {
+            return capture.run();
+        }
+        self.enqueue_repeatable()
+    }
+
+    fn enqueue_repeatable(&mut self) -> Result<(), ExecutionError> {
         for step in &mut self.steps {
             step.run(&self.workspace)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn configure_capture(
+        &mut self,
+        required: bool,
+    ) -> Result<CaptureStatus, ExecutionError> {
+        let mut runtime = NativeCaptureRuntime {
+            context: self.context,
+            steps: &mut self.steps,
+            workspace: &self.workspace,
+        };
+        match configure_capture(&mut runtime, required)? {
+            CaptureAttempt::Ready(capture) => {
+                self.capture = Some(capture);
+                Ok(CaptureStatus::Ready)
+            }
+            CaptureAttempt::SkippedUnsupported { reason } => {
+                Ok(CaptureStatus::SkippedUnsupported { reason })
+            }
+        }
     }
 
     pub(crate) fn synchronize(&self) -> Result<(), ExecutionError> {
@@ -230,7 +260,41 @@ impl Drop for ExecutableState<'_> {
         let _ = self.context.synchronize();
         // Executors retain descriptor/scalar/array objects. Destroy them before
         // workspace, scratch, semantic storage, and finally the session.
+        self.capture.take();
         self.steps.clear();
+    }
+}
+
+struct NativeCaptureRuntime<'state, 'session> {
+    context: &'session super::context::Context,
+    steps: &'state mut [PreparedStep<'session>],
+    workspace: &'state DeviceBuffer<'session>,
+}
+
+impl<'session> CaptureRuntime for NativeCaptureRuntime<'_, 'session> {
+    type Handle = Capture<'session>;
+
+    fn supported(&mut self) -> Result<bool, ExecutionError> {
+        Capture::supported(self.context)
+    }
+
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
+        self.context.synchronize()
+    }
+
+    fn begin(&mut self) -> Result<(), ExecutionError> {
+        Capture::begin(self.context)
+    }
+
+    fn enqueue_repeatable(&mut self) -> Result<(), ExecutionError> {
+        for step in &mut *self.steps {
+            step.run(self.workspace)?;
+        }
+        Ok(())
+    }
+
+    fn end(&mut self) -> Result<Self::Handle, ExecutionError> {
+        Capture::end(self.context)
     }
 }
 

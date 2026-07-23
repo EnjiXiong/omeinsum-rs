@@ -4,6 +4,7 @@
 
 #![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
 
+mod capture;
 pub mod context;
 mod error;
 pub(crate) mod executable;
@@ -141,19 +142,35 @@ impl<'session> AscendExecutable<'session> {
         inputs: &InputSet<f64>,
         config: &AscendExecutableConfig,
     ) -> Result<Self, ExecutionError> {
-        if config.execution_mode != AscendExecutionMode::RepeatableAclnn {
-            return Err(ExecutionError::Unsupported(
-                "captured Ascend execution is not enabled yet".to_string(),
-            ));
-        }
         let (state, memory_stats) = executable::ExecutableState::prepare(session, plan, inputs)?;
-        Ok(Self {
+        let mut executable = Self {
             session,
             representation: plan.representation.clone(),
             state,
             memory_stats,
             capture_status: CaptureStatus::NotRequested,
-        })
+        };
+        if config.execution_mode == AscendExecutionMode::CapturedModel {
+            executable.capture_status = executable.state.configure_capture(true)?;
+        }
+        Ok(executable)
+    }
+
+    pub fn prepare_auto_capture(
+        session: &'session AscendSession,
+        plan: &StaticPlan,
+        inputs: &InputSet<f64>,
+    ) -> Result<Self, ExecutionError> {
+        let (state, memory_stats) = executable::ExecutableState::prepare(session, plan, inputs)?;
+        let mut executable = Self {
+            session,
+            representation: plan.representation.clone(),
+            state,
+            memory_stats,
+            capture_status: CaptureStatus::NotRequested,
+        };
+        executable.capture_status = executable.state.configure_capture(false)?;
+        Ok(executable)
     }
 
     pub fn memory_stats(&self) -> &AscendMemoryStats {
@@ -172,5 +189,13 @@ impl<'session> AscendExecutable<'session> {
         let mut timings = self.state.phase_timings.clone();
         timings.context_create_seconds = self.session.context_create_seconds;
         timings
+    }
+
+    pub fn execution_mode(&self) -> AscendExecutionMode {
+        if self.capture_status == CaptureStatus::Ready {
+            AscendExecutionMode::CapturedModel
+        } else {
+            AscendExecutionMode::RepeatableAclnn
+        }
     }
 }

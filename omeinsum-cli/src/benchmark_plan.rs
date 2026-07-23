@@ -138,11 +138,7 @@ fn benchmark_ascend(
     if dtype != "f32" {
         return Err("Ascend benchmarking requires --dtype f32".to_string());
     }
-    if capture_realified != "off" {
-        return Err(format!(
-            "capture policy {capture_realified:?} is not enabled yet; use off"
-        ));
-    }
+    let capture_policy = RealifiedCapturePolicy::parse(capture_realified)?;
     let precision = parse_ascend_precision(precision_mode)?;
     let device_id =
         device_id.ok_or_else(|| "--device-id is required with --backend ascend".to_string())?;
@@ -162,17 +158,48 @@ fn benchmark_ascend(
     let mut executables = selected
         .into_iter()
         .map(|plan| {
-            AscendExecutable::prepare(
-                &session,
-                plan,
-                &bundle.inputs,
-                &AscendExecutableConfig {
-                    execution_mode: AscendExecutionMode::RepeatableAclnn,
-                },
-            )
+            if plan.representation == omeinsum::static_plan::Representation::RealifiedRank3 {
+                match capture_policy {
+                    RealifiedCapturePolicy::Off => AscendExecutable::prepare(
+                        &session,
+                        plan,
+                        &bundle.inputs,
+                        &AscendExecutableConfig {
+                            execution_mode: AscendExecutionMode::RepeatableAclnn,
+                        },
+                    ),
+                    RealifiedCapturePolicy::Auto => {
+                        AscendExecutable::prepare_auto_capture(&session, plan, &bundle.inputs)
+                    }
+                    RealifiedCapturePolicy::Required => AscendExecutable::prepare(
+                        &session,
+                        plan,
+                        &bundle.inputs,
+                        &AscendExecutableConfig {
+                            execution_mode: AscendExecutionMode::CapturedModel,
+                        },
+                    ),
+                }
+            } else {
+                AscendExecutable::prepare(
+                    &session,
+                    plan,
+                    &bundle.inputs,
+                    &AscendExecutableConfig {
+                        execution_mode: AscendExecutionMode::RepeatableAclnn,
+                    },
+                )
+            }
             .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let capture = executables
+        .iter()
+        .find(|executable| {
+            executable.representation() == omeinsum::static_plan::Representation::RealifiedRank3
+        })
+        .map(|executable| executable.capture_status().clone())
+        .unwrap_or(CaptureStatus::NotRequested);
     let memory = executables
         .iter()
         .map(|executable| {
@@ -182,12 +209,20 @@ fn benchmark_ascend(
             )
         })
         .collect::<Vec<_>>();
+    let execution_modes = executables
+        .iter()
+        .map(|executable| match executable.execution_mode() {
+            AscendExecutionMode::RepeatableAclnn => "repeatable-aclnn",
+            AscendExecutionMode::CapturedModel => "captured-model",
+        })
+        .collect::<Vec<_>>();
     let mut targets = executables
         .iter_mut()
-        .map(|executable| BenchmarkTarget {
+        .zip(&execution_modes)
+        .map(|(executable, execution_mode)| BenchmarkTarget {
             backend: "ascend",
             dtype: "f32",
-            execution_mode: "repeatable-aclnn",
+            execution_mode,
             executable,
         })
         .collect::<Vec<_>>();
@@ -215,11 +250,33 @@ fn benchmark_ascend(
         timings,
         device: Some(session.device_info().clone()),
         memory,
-        capture: CaptureStatus::NotRequested,
+        capture,
         precision_mode: Some(precision),
         phases: Some(phases),
         lowering,
     })
+}
+
+#[cfg(feature = "ascend")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealifiedCapturePolicy {
+    Off,
+    Auto,
+    Required,
+}
+
+#[cfg(feature = "ascend")]
+impl RealifiedCapturePolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "off" => Ok(Self::Off),
+            "auto" => Ok(Self::Auto),
+            "required" => Ok(Self::Required),
+            _ => Err(format!(
+                "unsupported capture policy {value:?}; expected off, auto, or required"
+            )),
+        }
+    }
 }
 
 #[cfg(not(feature = "ascend"))]

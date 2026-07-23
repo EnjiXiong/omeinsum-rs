@@ -111,6 +111,12 @@ struct ome_ascend_op {
     uint64_t workspace_bytes = 0;
 };
 
+struct ome_ascend_capture {
+#ifdef OME_ASCEND_ENABLE_CAPTURE
+    aclmdlRI model = nullptr;
+#endif
+};
+
 namespace {
 void cleanup_context(ome_ascend_context *context) noexcept {
     if (context == nullptr) {
@@ -591,6 +597,122 @@ extern "C" void ome_ascend_op_destroy(ome_ascend_op_t *op) {
     try {
         cleanup_op(op);
         delete op;
+    } catch (...) {
+    }
+}
+
+extern "C" ome_ascend_status_t ome_ascend_capture_supported(
+    ome_ascend_context_t *context, int32_t *supported) {
+    return guarded("ome_ascend_capture_supported", [&]() {
+        if (context == nullptr || supported == nullptr) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_capture_supported",
+                         "context or supported is null");
+        }
+#ifdef OME_ASCEND_ENABLE_CAPTURE
+        aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+        aclmdlRI model = nullptr;
+        const aclError code =
+            aclmdlRICaptureGetInfo(context->stream, &status, &model);
+        if (code != ACL_SUCCESS) {
+            *supported = 0;
+            return error(kUnsupported, static_cast<int32_t>(code),
+                         "aclmdlRICaptureGetInfo",
+                         "live runtime/device probe rejected model-RI capture");
+        }
+        *supported = 1;
+#else
+        *supported = 0;
+#endif
+        return ok();
+    });
+}
+
+extern "C" ome_ascend_status_t ome_ascend_capture_begin(
+    ome_ascend_context_t *context) {
+    return guarded("ome_ascend_capture_begin", [&]() {
+        if (context == nullptr) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_capture_begin", "context is null");
+        }
+#ifdef OME_ASCEND_ENABLE_CAPTURE
+        const aclError code = aclmdlRICaptureBegin(
+            context->stream, ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+        return code == ACL_SUCCESS
+                   ? ok()
+                   : runtime_error("aclmdlRICaptureBegin", code);
+#else
+        return error(kUnsupported, -1, "ome_ascend_capture_begin",
+                     "shim was built without OME_ASCEND_ENABLE_CAPTURE=1");
+#endif
+    });
+}
+
+extern "C" ome_ascend_status_t ome_ascend_capture_end(
+    ome_ascend_context_t *context, ome_ascend_capture_t **out) {
+    return guarded("ome_ascend_capture_end", [&]() {
+        if (context == nullptr || out == nullptr) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_capture_end",
+                         "context or out is null");
+        }
+        *out = nullptr;
+#ifdef OME_ASCEND_ENABLE_CAPTURE
+        auto capture = std::make_unique<ome_ascend_capture>();
+        const aclError code =
+            aclmdlRICaptureEnd(context->stream, &capture->model);
+        if (code != ACL_SUCCESS) {
+            return runtime_error("aclmdlRICaptureEnd", code);
+        }
+        if (capture->model == nullptr) {
+            return error(kRuntime, -1, "aclmdlRICaptureEnd",
+                         "returned a null model RI");
+        }
+        *out = capture.release();
+        return ok();
+#else
+        return error(kUnsupported, -1, "ome_ascend_capture_end",
+                     "shim was built without OME_ASCEND_ENABLE_CAPTURE=1");
+#endif
+    });
+}
+
+extern "C" ome_ascend_status_t ome_ascend_capture_run(
+    ome_ascend_context_t *context, ome_ascend_capture_t *capture) {
+    return guarded("ome_ascend_capture_run", [&]() {
+        if (context == nullptr || capture == nullptr) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_capture_run",
+                         "context or capture is null");
+        }
+#ifdef OME_ASCEND_ENABLE_CAPTURE
+        if (capture->model == nullptr) {
+            return error(kInvalidArgument, -1,
+                         "ome_ascend_capture_run",
+                         "capture model is null");
+        }
+        const aclError code =
+            aclmdlRIExecuteAsync(capture->model, context->stream);
+        return code == ACL_SUCCESS
+                   ? ok()
+                   : runtime_error("aclmdlRIExecuteAsync", code);
+#else
+        return error(kUnsupported, -1, "ome_ascend_capture_run",
+                     "shim was built without OME_ASCEND_ENABLE_CAPTURE=1");
+#endif
+    });
+}
+
+extern "C" void ome_ascend_capture_destroy(
+    ome_ascend_capture_t *capture) {
+    try {
+#ifdef OME_ASCEND_ENABLE_CAPTURE
+        if (capture != nullptr && capture->model != nullptr) {
+            (void)aclmdlRIDestroy(capture->model);
+            capture->model = nullptr;
+        }
+#endif
+        delete capture;
     } catch (...) {
     }
 }
