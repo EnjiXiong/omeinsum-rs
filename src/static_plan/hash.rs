@@ -41,3 +41,34 @@ impl StaticPlan {
         plan_hash(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::hash_serializable;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct FloatingCost {
+        predicted_arithmetic_overhead: f64,
+    }
+
+    #[test]
+    fn hash_floats_survive_json_round_trip_bit_exactly() {
+        let original = FloatingCost {
+            predicted_arithmetic_overhead: 1026.0 / 454.0,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let round_trip: FloatingCost = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            original.predicted_arithmetic_overhead.to_bits(),
+            round_trip.predicted_arithmetic_overhead.to_bits(),
+            "JSON {json} changed the f64 used by static-plan hashing"
+        );
+        assert_eq!(
+            hash_serializable(&original).unwrap(),
+            hash_serializable(&round_trip).unwrap()
+        );
+    }
+}
