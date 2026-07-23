@@ -107,13 +107,13 @@ fn main() {
         data: constants::M_DATA.map(|value| value as f32).to_vec(),
     }));
 
-    // TreeSA seeds trial 0 with 42, so this one-trial configuration is reproducible.
-    // The 2^28-element target leaves headroom beyond the largest intermediate on
-    // both the 64 GiB Ascend device and 80 GiB A800.
+    // TreeSA seeds trial 0 with 42. The emitted order is archived rather than
+    // regenerated per backend, so any equal-score tie-breaking cannot bias devices.
+    // The 2^28-element target leaves allocation headroom on both accelerators.
     let optimizer = TreeSA::fast().with_sc_target(28.0);
     let code = plan.einsum.code();
     let tree = optimize_code(&code, &plan.einsum.size_dict, &optimizer)
-        .expect("deterministic TreeSA optimizer produced no contraction tree");
+        .expect("TreeSA optimizer produced no contraction tree");
     let complexity = contraction_complexity(&tree, &plan.einsum.size_dict, &plan.einsum.ixs);
     let artifact = BenchmarkNetwork {
         format: "omeinsum-real-f32-benchmark-v1".to_string(),
