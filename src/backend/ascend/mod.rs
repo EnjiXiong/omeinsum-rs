@@ -12,6 +12,7 @@ pub(crate) mod operator;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::static_plan::{ExecutionError, InputSet, Representation, StaticPlan};
 
@@ -57,6 +58,17 @@ pub struct AscendDeviceInfo {
     pub soc_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AscendPhaseTimings {
+    pub context_create_seconds: f64,
+    pub plan_lower_seconds: f64,
+    pub allocation_seconds: f64,
+    pub descriptor_executor_prepare_seconds: f64,
+    pub h2d_seconds: f64,
+    pub warmup_seconds: f64,
+    pub d2h_seconds: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CaptureStatus {
@@ -68,6 +80,7 @@ pub enum CaptureStatus {
 pub struct AscendSession {
     pub(crate) context: Context,
     pub(crate) device_info: AscendDeviceInfo,
+    pub(crate) context_create_seconds: f64,
 }
 
 pub struct AscendExecutable<'session> {
@@ -85,7 +98,9 @@ impl AscendSession {
                 "Ascend supports only keep-dtype precision".to_string(),
             ));
         }
+        let start = Instant::now();
         let context = Context::new(config.device_id)?;
+        let context_create_seconds = start.elapsed().as_secs_f64();
         let device_info = AscendDeviceInfo {
             device_id: context.device_id(),
             soc_name: context.soc_name().to_string(),
@@ -93,11 +108,16 @@ impl AscendSession {
         Ok(Self {
             context,
             device_info,
+            context_create_seconds,
         })
     }
 
     pub fn device_info(&self) -> &AscendDeviceInfo {
         &self.device_info
+    }
+
+    pub fn context_create_seconds(&self) -> f64 {
+        self.context_create_seconds
     }
 
     #[doc(hidden)]
@@ -146,5 +166,11 @@ impl<'session> AscendExecutable<'session> {
 
     pub fn device_info(&self) -> &AscendDeviceInfo {
         self.session.device_info()
+    }
+
+    pub fn phase_timings(&self) -> AscendPhaseTimings {
+        let mut timings = self.state.phase_timings.clone();
+        timings.context_create_seconds = self.session.context_create_seconds;
+        timings
     }
 }

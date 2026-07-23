@@ -74,6 +74,11 @@ pub struct BenchmarkTarget<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkDiagnostics {
+    pub warmup_seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModeTiming {
     pub representation: Representation,
     pub backend: String,
@@ -95,6 +100,13 @@ pub fn benchmark_prepared(
     targets: &mut [BenchmarkTarget<'_>],
     config: &BenchmarkConfig,
 ) -> Result<Vec<ModeTiming>, ExecutionError> {
+    benchmark_prepared_with_diagnostics(targets, config).map(|(timings, _)| timings)
+}
+
+pub fn benchmark_prepared_with_diagnostics(
+    targets: &mut [BenchmarkTarget<'_>],
+    config: &BenchmarkConfig,
+) -> Result<(Vec<ModeTiming>, BenchmarkDiagnostics), ExecutionError> {
     if targets.is_empty() {
         return Err(ExecutionError::Unsupported(
             "at least one benchmark target is required".to_string(),
@@ -108,6 +120,7 @@ pub fn benchmark_prepared(
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.measurement_order_seed);
     let mut order: Vec<_> = (0..targets.len()).collect();
+    let warmup_start = Instant::now();
     for _ in 0..config.warmups {
         order.shuffle(&mut rng);
         for index in order.iter().copied() {
@@ -115,6 +128,7 @@ pub fn benchmark_prepared(
             targets[index].executable.synchronize()?;
         }
     }
+    let warmup_seconds = warmup_start.elapsed().as_secs_f64();
 
     let threshold = Duration::from_millis(config.min_sample_ms);
     let mut inner_iterations = Vec::with_capacity(targets.len());
@@ -152,7 +166,7 @@ pub fn benchmark_prepared(
         }
     }
 
-    targets
+    let timings = targets
         .iter_mut()
         .zip(inner_iterations)
         .zip(raw)
@@ -182,7 +196,8 @@ pub fn benchmark_prepared(
                 })
             },
         )
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((timings, BenchmarkDiagnostics { warmup_seconds }))
 }
 
 fn summarize(samples: &[f64]) -> Result<(f64, f64, f64), ExecutionError> {

@@ -159,6 +159,14 @@ enum Commands {
         #[arg(long, default_value = "f64")]
         dtype: String,
 
+        /// Ascend device id (required with --backend ascend)
+        #[arg(long)]
+        device_id: Option<i32>,
+
+        /// Ascend precision mode
+        #[arg(long, default_value = "keep-dtype")]
+        precision_mode: String,
+
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
@@ -183,6 +191,18 @@ enum Commands {
         /// Floating-point dtype
         #[arg(long, default_value = "f64")]
         dtype: String,
+
+        /// Ascend device id (required with --backend ascend)
+        #[arg(long)]
+        device_id: Option<i32>,
+
+        /// Ascend precision mode
+        #[arg(long, default_value = "keep-dtype")]
+        precision_mode: String,
+
+        /// Capture policy for realified-rank3: off, auto, or required
+        #[arg(long, default_value = "off")]
+        capture_realified: String,
 
         /// Untimed warm-up rounds
         #[arg(long, default_value_t = 3)]
@@ -285,6 +305,8 @@ fn main() {
             backend,
             representations,
             dtype,
+            device_id,
+            precision_mode,
             output,
             pretty,
         } => execute_plan::run(
@@ -292,6 +314,8 @@ fn main() {
             &backend,
             &representations,
             &dtype,
+            device_id,
+            &precision_mode,
             output.as_deref(),
             pretty,
         ),
@@ -300,6 +324,9 @@ fn main() {
             backend,
             representations,
             dtype,
+            device_id,
+            precision_mode,
+            capture_realified,
             warmups,
             samples,
             min_sample_ms,
@@ -311,6 +338,9 @@ fn main() {
             &backend,
             &representations,
             &dtype,
+            device_id,
+            &precision_mode,
+            &capture_realified,
             warmups,
             samples,
             min_sample_ms,

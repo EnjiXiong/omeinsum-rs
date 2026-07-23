@@ -273,6 +273,138 @@ fn benchmark_plan_emits_shortened_cpu_test_protocol() {
     }
 }
 
+#[cfg(not(feature = "ascend"))]
+#[test]
+fn execute_plan_ascend_requires_feature_build() {
+    let plan = build_static_plan_file();
+    cmd()
+        .args([
+            "execute-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "ascend",
+            "--dtype",
+            "f32",
+            "--device-id",
+            "0",
+            "--precision-mode",
+            "keep-dtype",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("rebuild with --features ascend"));
+}
+
+#[cfg(not(feature = "ascend"))]
+#[test]
+fn benchmark_plan_ascend_requires_feature_build() {
+    let plan = build_static_plan_file();
+    cmd()
+        .args([
+            "benchmark-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "ascend",
+            "--dtype",
+            "f32",
+            "--device-id",
+            "0",
+            "--precision-mode",
+            "keep-dtype",
+            "--capture-realified",
+            "off",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("rebuild with --features ascend"));
+}
+
+#[cfg(feature = "ascend")]
+#[test]
+#[ignore = "requires a live Ascend device and CANN runtime"]
+fn ascend_execute_and_benchmark_report_fixed_device_diagnostics() {
+    let plan = build_static_plan_file();
+    let execution = cmd()
+        .args([
+            "execute-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "ascend",
+            "--representations",
+            "real-skeleton,flat-4m,realified-rank3",
+            "--dtype",
+            "f32",
+            "--device-id",
+            "0",
+            "--precision-mode",
+            "keep-dtype",
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        execution.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    let execution: serde_json::Value = serde_json::from_slice(&execution.stdout).unwrap();
+    assert_eq!(execution["device"]["device_id"], 0);
+    assert_eq!(execution["precision_mode"], "keep-dtype");
+    assert_eq!(execution["executions"].as_array().unwrap().len(), 3);
+    assert!(execution["executions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["memory"]["peak_device_bytes"].as_u64().unwrap() > 0));
+
+    let benchmark = cmd()
+        .args([
+            "benchmark-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "ascend",
+            "--representations",
+            "real-skeleton,flat-4m,realified-rank3",
+            "--dtype",
+            "f32",
+            "--device-id",
+            "0",
+            "--precision-mode",
+            "keep-dtype",
+            "--capture-realified",
+            "off",
+            "--warmups",
+            "1",
+            "--samples",
+            "1",
+            "--min-sample-ms",
+            "1",
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        benchmark.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&benchmark.stderr)
+    );
+    let benchmark: serde_json::Value = serde_json::from_slice(&benchmark.stdout).unwrap();
+    assert_eq!(benchmark["device"], execution["device"]);
+    assert_eq!(benchmark["memory"].as_array().unwrap().len(), 3);
+    assert_eq!(benchmark["lowering"].as_array().unwrap().len(), 3);
+    assert_eq!(benchmark["capture"], "not-requested");
+    assert!(benchmark["phases"]["h2d_seconds"].as_f64().unwrap() >= 0.0);
+    assert!(benchmark["phases"]["warmup_seconds"].as_f64().unwrap() >= 0.0);
+    assert!(benchmark["phases"]["d2h_seconds"].as_f64().unwrap() >= 0.0);
+    assert!(benchmark["timings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|timing| timing["inner_iterations"].as_u64().unwrap() >= 1));
+}
+
 #[test]
 fn test_optimize_matmul() {
     cmd()

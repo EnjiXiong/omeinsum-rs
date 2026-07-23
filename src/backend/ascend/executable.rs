@@ -7,7 +7,8 @@ use crate::static_plan::{
 
 use super::operator::{PreparedOp, PreparedStep};
 use super::storage::{DeviceBuffer, TensorDescriptor};
-use super::{AscendMemoryStats, AscendSession};
+use super::{AscendMemoryStats, AscendPhaseTimings, AscendSession};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferKind {
@@ -57,6 +58,7 @@ pub(crate) struct ExecutableState<'session> {
     output_planes: usize,
     output_elements: usize,
     context: &'session super::context::Context,
+    pub(crate) phase_timings: AscendPhaseTimings,
 }
 
 impl<'session> ExecutableState<'session> {
@@ -65,6 +67,7 @@ impl<'session> ExecutableState<'session> {
         plan: &StaticPlan,
         inputs: &InputSet<f64>,
     ) -> Result<(Self, AscendMemoryStats), ExecutionError> {
+        let lower_start = Instant::now();
         plan.validate()
             .map_err(|error| ExecutionError::InvalidPlan(error.to_string()))?;
         validate_inputs(plan, inputs)?;
@@ -80,12 +83,18 @@ impl<'session> ExecutableState<'session> {
             .map(|resources| resources.bytes)
             .max()
             .unwrap_or(0);
+        let plan_lower_seconds = lower_start.elapsed().as_secs_f64();
 
+        let allocation_start = Instant::now();
         let semantic_arena = session.context.allocate(arena.arena_bytes)?;
         let scratch = session.context.allocate(scratch_bytes)?;
+        let mut allocation_seconds = allocation_start.elapsed().as_secs_f64();
+        let h2d_start = Instant::now();
         upload_inputs(&semantic_arena, plan, inputs, &value_layouts)?;
         session.context.synchronize()?;
+        let h2d_seconds = h2d_start.elapsed().as_secs_f64();
 
+        let descriptor_start = Instant::now();
         let mut steps = Vec::new();
         for (node, resources) in plan.nodes.iter().zip(&node_resources) {
             let left = prepare_operand(
@@ -127,7 +136,10 @@ impl<'session> ExecutableState<'session> {
             .map(PreparedStep::workspace_bytes)
             .max()
             .unwrap_or(0);
+        let descriptor_executor_prepare_seconds = descriptor_start.elapsed().as_secs_f64();
+        let workspace_allocation_start = Instant::now();
         let workspace = session.context.allocate(workspace_bytes)?;
+        allocation_seconds += workspace_allocation_start.elapsed().as_secs_f64();
         let peak_device_bytes = arena
             .arena_bytes
             .checked_add(scratch_bytes)
@@ -155,6 +167,15 @@ impl<'session> ExecutableState<'session> {
                 output_planes: output.planes,
                 output_elements: output.elements,
                 context: &session.context,
+                phase_timings: AscendPhaseTimings {
+                    context_create_seconds: 0.0,
+                    plan_lower_seconds,
+                    allocation_seconds,
+                    descriptor_executor_prepare_seconds,
+                    h2d_seconds,
+                    warmup_seconds: 0.0,
+                    d2h_seconds: 0.0,
+                },
             },
             stats,
         ))
@@ -171,13 +192,14 @@ impl<'session> ExecutableState<'session> {
         self.context.synchronize()
     }
 
-    pub(crate) fn output(&self) -> Result<ComplexValue, ExecutionError> {
+    pub(crate) fn output(&mut self) -> Result<ComplexValue, ExecutionError> {
         if self.output_elements != 1 {
             return Err(ExecutionError::InvalidPlan(format!(
                 "Ascend output has {} elements; expected a scalar",
                 self.output_elements
             )));
         }
+        let d2h_start = Instant::now();
         let mut real = [0.0f32; 1];
         self.semantic_arena
             .copy_d2h(self.output_offset, &mut real)?;
@@ -191,6 +213,7 @@ impl<'session> ExecutableState<'session> {
             )?;
         }
         self.context.synchronize()?;
+        self.phase_timings.d2h_seconds += d2h_start.elapsed().as_secs_f64();
         let value = ComplexValue {
             re: f64::from(real[0]),
             im: f64::from(imag[0]),

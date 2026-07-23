@@ -4,7 +4,18 @@ use omeinsum::static_plan::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::execute_plan::{prepare_cpu, read_bundle, select_plans, validate_cpu_backend, CpuDtype};
+use crate::execute_plan::{prepare_cpu, read_bundle, select_plans, CpuDtype};
+
+#[cfg(feature = "ascend")]
+use crate::execute_plan::parse_ascend_precision;
+#[cfg(feature = "ascend")]
+use omeinsum::backend::ascend::{
+    AscendDeviceInfo, AscendExecutable, AscendExecutableConfig, AscendExecutionMode,
+    AscendMemoryStats, AscendPhaseTimings, AscendPrecisionMode, AscendSession, AscendSessionConfig,
+    CaptureStatus,
+};
+#[cfg(feature = "ascend")]
+use omeinsum::static_plan::benchmark_prepared_with_diagnostics;
 
 #[derive(Serialize, Deserialize)]
 struct BenchmarkPlanReport {
@@ -12,6 +23,21 @@ struct BenchmarkPlanReport {
     tree_hash: String,
     reference_complex64: ComplexValue,
     timings: Vec<ModeTiming>,
+    #[cfg(feature = "ascend")]
+    device: Option<AscendDeviceInfo>,
+    #[cfg(feature = "ascend")]
+    memory: Vec<(omeinsum::static_plan::Representation, AscendMemoryStats)>,
+    #[cfg(feature = "ascend")]
+    capture: CaptureStatus,
+    #[cfg(feature = "ascend")]
+    precision_mode: Option<AscendPrecisionMode>,
+    #[cfg(feature = "ascend")]
+    phases: Option<AscendPhaseTimings>,
+    #[cfg(feature = "ascend")]
+    lowering: Vec<(
+        omeinsum::static_plan::Representation,
+        Vec<omeinsum::static_plan::LoweredNodeTrace>,
+    )>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20,6 +46,9 @@ pub(crate) fn run(
     backend: &str,
     representations: &str,
     dtype: &str,
+    device_id: Option<i32>,
+    precision_mode: &str,
+    capture_realified: &str,
     warmups: usize,
     samples: usize,
     min_sample_ms: u64,
@@ -27,8 +56,6 @@ pub(crate) fn run(
     output: Option<&str>,
     pretty: Option<bool>,
 ) -> Result<(), String> {
-    validate_cpu_backend(backend)?;
-    let dtype = CpuDtype::parse(dtype)?;
     let bundle = read_bundle(plan_path)?;
     let selected = select_plans(&bundle, representations)?;
     let reference_complex64 = contract_complex64(&bundle.realified_rank3, &bundle.inputs)
@@ -40,26 +67,172 @@ pub(crate) fn run(
         measurement_order_seed,
     };
 
+    let report = match backend {
+        "cpu" => {
+            let dtype = CpuDtype::parse(dtype)?;
+            let mut executables = selected
+                .into_iter()
+                .map(|plan| prepare_cpu(plan, &bundle, dtype))
+                .collect::<Result<Vec<Box<dyn PreparedExecutable>>, _>>()?;
+            let mut targets = executables
+                .iter_mut()
+                .map(|executable| BenchmarkTarget {
+                    backend: "cpu",
+                    dtype: dtype.name(),
+                    execution_mode: "prepared",
+                    executable: executable.as_mut(),
+                })
+                .collect::<Vec<_>>();
+            let timings =
+                benchmark_prepared(&mut targets, &config).map_err(|error| error.to_string())?;
+            BenchmarkPlanReport {
+                format: "omeinsum-benchmark-report-v1".to_string(),
+                tree_hash: bundle.tree_hash,
+                reference_complex64,
+                timings,
+                #[cfg(feature = "ascend")]
+                device: None,
+                #[cfg(feature = "ascend")]
+                memory: vec![],
+                #[cfg(feature = "ascend")]
+                capture: CaptureStatus::NotRequested,
+                #[cfg(feature = "ascend")]
+                precision_mode: None,
+                #[cfg(feature = "ascend")]
+                phases: None,
+                #[cfg(feature = "ascend")]
+                lowering: vec![],
+            }
+        }
+        "ascend" => benchmark_ascend(
+            &bundle,
+            selected,
+            reference_complex64,
+            dtype,
+            device_id,
+            precision_mode,
+            capture_realified,
+            &config,
+        )?,
+        _ => {
+            return Err(format!(
+                "unsupported backend {backend:?}; expected cpu or ascend"
+            ))
+        }
+    };
+    crate::common::write_json_output(&report, output, pretty)
+}
+
+#[cfg(feature = "ascend")]
+#[allow(clippy::too_many_arguments)]
+fn benchmark_ascend(
+    bundle: &omeinsum::static_plan::PlanBundle,
+    selected: Vec<&omeinsum::static_plan::StaticPlan>,
+    reference_complex64: ComplexValue,
+    dtype: &str,
+    device_id: Option<i32>,
+    precision_mode: &str,
+    capture_realified: &str,
+    config: &BenchmarkConfig,
+) -> Result<BenchmarkPlanReport, String> {
+    if dtype != "f32" {
+        return Err("Ascend benchmarking requires --dtype f32".to_string());
+    }
+    if capture_realified != "off" {
+        return Err(format!(
+            "capture policy {capture_realified:?} is not enabled yet; use off"
+        ));
+    }
+    let precision = parse_ascend_precision(precision_mode)?;
+    let device_id =
+        device_id.ok_or_else(|| "--device-id is required with --backend ascend".to_string())?;
+    let session = AscendSession::new(&AscendSessionConfig {
+        device_id,
+        precision_mode: precision,
+    })
+    .map_err(|error| error.to_string())?;
+    let lowering = selected
+        .iter()
+        .map(|plan| {
+            omeinsum::static_plan::lower_plan_traces(plan)
+                .map(|trace| (plan.representation.clone(), trace))
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut executables = selected
         .into_iter()
-        .map(|plan| prepare_cpu(plan, &bundle, dtype))
-        .collect::<Result<Vec<Box<dyn PreparedExecutable>>, _>>()?;
+        .map(|plan| {
+            AscendExecutable::prepare(
+                &session,
+                plan,
+                &bundle.inputs,
+                &AscendExecutableConfig {
+                    execution_mode: AscendExecutionMode::RepeatableAclnn,
+                },
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let memory = executables
+        .iter()
+        .map(|executable| {
+            (
+                executable.representation(),
+                executable.memory_stats().clone(),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut targets = executables
         .iter_mut()
         .map(|executable| BenchmarkTarget {
-            backend: "cpu",
-            dtype: dtype.name(),
-            execution_mode: "prepared",
-            executable: executable.as_mut(),
+            backend: "ascend",
+            dtype: "f32",
+            execution_mode: "repeatable-aclnn",
+            executable,
         })
         .collect::<Vec<_>>();
-    let timings = benchmark_prepared(&mut targets, &config).map_err(|error| error.to_string())?;
+    let (timings, diagnostics) = benchmark_prepared_with_diagnostics(&mut targets, config)
+        .map_err(|error| error.to_string())?;
+    drop(targets);
 
-    let report = BenchmarkPlanReport {
+    let mut phases = AscendPhaseTimings {
+        context_create_seconds: session.context_create_seconds(),
+        warmup_seconds: diagnostics.warmup_seconds,
+        ..AscendPhaseTimings::default()
+    };
+    for executable in &executables {
+        let timing = executable.phase_timings();
+        phases.plan_lower_seconds += timing.plan_lower_seconds;
+        phases.allocation_seconds += timing.allocation_seconds;
+        phases.descriptor_executor_prepare_seconds += timing.descriptor_executor_prepare_seconds;
+        phases.h2d_seconds += timing.h2d_seconds;
+        phases.d2h_seconds += timing.d2h_seconds;
+    }
+    Ok(BenchmarkPlanReport {
         format: "omeinsum-benchmark-report-v1".to_string(),
-        tree_hash: bundle.tree_hash,
+        tree_hash: bundle.tree_hash.clone(),
         reference_complex64,
         timings,
-    };
-    crate::common::write_json_output(&report, output, pretty)
+        device: Some(session.device_info().clone()),
+        memory,
+        capture: CaptureStatus::NotRequested,
+        precision_mode: Some(precision),
+        phases: Some(phases),
+        lowering,
+    })
+}
+
+#[cfg(not(feature = "ascend"))]
+#[allow(clippy::too_many_arguments)]
+fn benchmark_ascend(
+    _bundle: &omeinsum::static_plan::PlanBundle,
+    _selected: Vec<&omeinsum::static_plan::StaticPlan>,
+    _reference_complex64: ComplexValue,
+    _dtype: &str,
+    _device_id: Option<i32>,
+    _precision_mode: &str,
+    _capture_realified: &str,
+    _config: &BenchmarkConfig,
+) -> Result<BenchmarkPlanReport, String> {
+    Err("Ascend backend unavailable; rebuild with --features ascend".to_string())
 }

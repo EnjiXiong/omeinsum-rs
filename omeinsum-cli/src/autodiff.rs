@@ -64,6 +64,7 @@ pub fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_real<T>(
     tensors_file: &TensorsFile,
     topology_path: Option<&str>,
@@ -122,6 +123,7 @@ where
     write_json_output(&result_file, output, pretty)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_complex<T>(
     tensors_file: &TensorsFile,
     topology_path: Option<&str>,

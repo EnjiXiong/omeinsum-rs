@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
 
 use super::{ExecutionError, KernelKind, StaticPlan};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoalescedPermutation {
@@ -9,7 +10,7 @@ pub struct CoalescedPermutation {
     pub output_shape: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoweredNodeTrace {
     pub node_id: usize,
     pub kind: KernelKind,

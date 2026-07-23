@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 name = "omeinsum"
 path = "src/main.rs"
 
+[features]
+default = []
+ascend = ["omeinsum/ascend"]
+
 [dependencies]
 omeinsum = { path = ".." }
 omeco = "0.2"
