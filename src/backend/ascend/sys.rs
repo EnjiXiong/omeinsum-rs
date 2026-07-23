@@ -6,6 +6,7 @@ pub type AclrtContext = *mut c_void;
 pub type AclrtStream = *mut c_void;
 pub type AclTensor = c_void;
 pub type AclIntArray = c_void;
+pub type AclScalar = c_void;
 pub type AclOpExecutor = c_void;
 
 pub const ACL_SUCCESS: i32 = 0;
@@ -69,6 +70,22 @@ extern "C" {
     pub fn aclDestroyTensor(tensor: *mut AclTensor) -> AclError;
     pub fn aclCreateIntArray(values: *const i64, len: u64) -> *mut AclIntArray;
     pub fn aclDestroyIntArray(array: *mut AclIntArray) -> AclError;
+    pub fn aclCreateScalar(value: *const c_void, data_type: i32) -> *mut AclScalar;
+    pub fn aclDestroyScalar(scalar: *mut AclScalar) -> AclError;
+    pub fn aclnnAddGetWorkspaceSize(
+        x: *const AclTensor,
+        y: *const AclTensor,
+        alpha: *const AclScalar,
+        output: *mut AclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut AclOpExecutor,
+    ) -> AclnnStatus;
+    pub fn aclnnAdd(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut AclOpExecutor,
+        stream: AclrtStream,
+    ) -> AclnnStatus;
     pub fn aclnnMatmulGetWorkspaceSize(
         a: *const AclTensor,
         b: *const AclTensor,

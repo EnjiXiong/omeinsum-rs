@@ -67,6 +67,14 @@ pub trait Backend: Clone + Send + Sync + 'static {
         offset: usize,
     ) -> Self::Storage<T>;
 
+    /// Compute `x + alpha * y` for equal-length contiguous f32 buffers.
+    fn linear_combination_f32(
+        &self,
+        x: &Self::Storage<f32>,
+        y: &Self::Storage<f32>,
+        alpha: f32,
+    ) -> Self::Storage<f32>;
+
     /// Binary tensor contraction.
     ///
     /// Computes a generalized tensor contraction: `C[modes_c] = Σ A[modes_a] ⊗ B[modes_b]`

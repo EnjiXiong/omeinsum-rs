@@ -1,5 +1,6 @@
 mod contract;
 mod ffi;
+mod linear_combination;
 mod normalize;
 mod permute;
 mod reduce;
@@ -58,6 +59,15 @@ impl Backend for Ascend {
     fn from_slice<T: Scalar>(&self, data: &[T]) -> AscendStorage<T> {
         AscendStorage::upload(self.runtime.clone(), data)
             .expect("Ascend aclrtMalloc/aclrtMemcpy(H2D) failed")
+    }
+    fn linear_combination_f32(
+        &self,
+        x: &AscendStorage<f32>,
+        y: &AscendStorage<f32>,
+        alpha: f32,
+    ) -> AscendStorage<f32> {
+        linear_combination::linear_combination(&self.runtime, x, y, alpha)
+            .unwrap_or_else(|error| panic!("Ascend ACLNN linear combination failed: {error}"))
     }
     fn copy_strided<T: Scalar>(
         &self,

@@ -666,6 +666,11 @@ impl Backend for Cpu {
         data.to_vec()
     }
 
+    fn linear_combination_f32(&self, x: &Vec<f32>, y: &Vec<f32>, alpha: f32) -> Vec<f32> {
+        assert_eq!(x.len(), y.len());
+        x.iter().zip(y).map(|(&x, &y)| x + alpha * y).collect()
+    }
+
     fn contract<A: Algebra>(
         &self,
         a: &Self::Storage<A::Scalar>,

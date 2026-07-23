@@ -47,6 +47,22 @@ fn test_cuda_init() {
     assert!(cuda.is_ok(), "Failed to initialize CUDA: {:?}", cuda.err());
 }
 
+#[test]
+fn cuda_f32_linear_combination_values_negative_alpha_and_cloned_calls() {
+    let cuda = Cuda::new().unwrap();
+    let clone = cuda.clone();
+    let x = Tensor::from_data_with_backend(&[1.0f32, -2.0, 3.5, 4.0], &[2, 2], cuda);
+    let y = Tensor::from_data_with_backend(&[2.0f32, 3.0, -1.0, 0.5], &[2, 2], clone);
+    assert_eq!(
+        x.linear_combination(&y, -2.0).to_vec(),
+        vec![-3.0, -8.0, 5.5, 3.0]
+    );
+    assert_eq!(
+        x.clone().linear_combination(&y.clone(), 0.5).to_vec(),
+        vec![2.0, -0.5, 3.0, 4.25]
+    );
+}
+
 /// Test host-to-device and device-to-host memory transfers (f32).
 #[test]
 fn test_storage_roundtrip_f32() {

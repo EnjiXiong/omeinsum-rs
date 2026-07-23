@@ -42,6 +42,22 @@ fn realify_c32_matmul_runs_as_f32_on_ascend() {
 }
 
 #[test]
+fn ascend_f32_linear_combination_values_negative_alpha_and_cloned_calls() {
+    let ascend = Ascend::new().expect("initialize Ascend device 0");
+    let clone = ascend.clone();
+    let x = Tensor::from_data_with_backend(&[1.0f32, -2.0, 3.5, 4.0], &[2, 2], ascend);
+    let y = Tensor::from_data_with_backend(&[2.0f32, 3.0, -1.0, 0.5], &[2, 2], clone);
+    assert_eq!(
+        x.linear_combination(&y, -2.0).to_vec(),
+        vec![-3.0, -8.0, 5.5, 3.0]
+    );
+    assert_eq!(
+        x.clone().linear_combination(&y.clone(), 0.5).to_vec(),
+        vec![2.0, -0.5, 3.0, 4.25]
+    );
+}
+
+#[test]
 fn rank_nine_operand_permutation_falls_back_with_cpu_parity() {
     let input_modes: Vec<usize> = (0..9).collect();
     let output_modes: Vec<usize> = (1..9).collect();

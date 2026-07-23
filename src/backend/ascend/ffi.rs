@@ -24,6 +24,27 @@ impl IntArray {
     }
 }
 
+pub(crate) struct Scalar(pub(crate) *mut sys::AclScalar);
+
+impl Scalar {
+    pub(crate) fn f32(value: f32) -> Result<Self, AscendError> {
+        let raw = unsafe { sys::aclCreateScalar((&value as *const f32).cast(), sys::ACL_FLOAT) };
+        (!raw.is_null())
+            .then_some(Self(raw))
+            .ok_or_else(|| AscendError::null("aclCreateScalar(f32)"))
+    }
+}
+
+impl Drop for Scalar {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = sys::aclDestroyScalar(self.0);
+            }
+        }
+    }
+}
+
 impl Drop for IntArray {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -42,6 +63,7 @@ impl Drop for IntArray {
 pub(crate) struct PendingOperation {
     tensors: ManuallyDrop<Vec<Tensor>>,
     arrays: ManuallyDrop<Vec<IntArray>>,
+    scalars: ManuallyDrop<Vec<Scalar>>,
     workspace: *mut std::ffi::c_void,
 }
 
@@ -54,8 +76,14 @@ impl PendingOperation {
         Self {
             tensors: ManuallyDrop::new(tensors),
             arrays: ManuallyDrop::new(arrays),
+            scalars: ManuallyDrop::new(Vec::new()),
             workspace,
         }
+    }
+
+    pub(crate) fn with_scalars(mut self, scalars: Vec<Scalar>) -> Self {
+        self.scalars = ManuallyDrop::new(scalars);
+        self
     }
 
     pub(crate) fn release(mut self, _runtime: &Runtime) {
@@ -66,6 +94,7 @@ impl PendingOperation {
             self.workspace = std::ptr::null_mut();
         }
         unsafe {
+            ManuallyDrop::drop(&mut self.scalars);
             ManuallyDrop::drop(&mut self.arrays);
             ManuallyDrop::drop(&mut self.tensors);
         }

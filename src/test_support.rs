@@ -53,6 +53,15 @@ impl Backend for TestBackend {
         dst
     }
 
+    fn linear_combination_f32(
+        &self,
+        x: &Self::Storage<f32>,
+        y: &Self::Storage<f32>,
+        alpha: f32,
+    ) -> Self::Storage<f32> {
+        x.iter().zip(y).map(|(&x, &y)| x + alpha * y).collect()
+    }
+
     fn contract<A: Algebra>(
         &self,
         _a: &Self::Storage<A::Scalar>,

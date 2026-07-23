@@ -243,6 +243,9 @@ pub struct Cuda {
     handle: Arc<Mutex<Option<Handle>>>,
     #[cfg(feature = "cuda")]
     cache: Arc<Mutex<PlanCache>>,
+    /// Cached NVRTC module for the f32 linear-combination kernel.
+    #[cfg(feature = "cuda")]
+    linear_combination_module: Arc<Mutex<Option<Arc<cudarc::driver::CudaModule>>>>,
     /// `tropical-gemm-cuda` context built once from the shared CUDA device and
     /// reused across contraction nodes (and across backend clones), instead of
     /// rebuilt (which reloads/recompiles the kernel module) on every tropical
@@ -373,6 +376,16 @@ extern "C" __global__ void gather_batched64(unsigned long long* out_ptrs,
 }
 "#;
 
+#[cfg(feature = "cuda")]
+const LINEAR_COMBINATION_KERNEL_SRC: &str = r#"
+extern "C" __global__ void linear_combination(float* out, const float* x,
+                                                const float* y, float alpha,
+                                                unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = x[i] + alpha * y[i];
+}
+"#;
+
 /// 1-D launch config for the elementwise gather kernels, sized for `numel`
 /// output elements with cudarc's `for_num_elems` layout (block = 1024) but the
 /// grid computed in 64-bit. `numel` is a `usize` and can exceed `u32::MAX` (a
@@ -413,6 +426,8 @@ impl Clone for Cuda {
             handle: self.handle.clone(),
             #[cfg(feature = "cuda")]
             cache: self.cache.clone(),
+            #[cfg(feature = "cuda")]
+            linear_combination_module: self.linear_combination_module.clone(),
             #[cfg(feature = "cuda-tropical")]
             tropical_ctx: self.tropical_ctx.clone(),
             #[cfg(feature = "cuda-tropical")]
@@ -453,6 +468,8 @@ impl Cuda {
             handle: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cuda")]
             cache: Arc::new(Mutex::new(PlanCache::new(64))),
+            #[cfg(feature = "cuda")]
+            linear_combination_module: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cuda-tropical")]
             tropical_ctx: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cuda-tropical")]
@@ -1911,6 +1928,59 @@ impl Backend for Cuda {
                 std::any::type_name::<T>()
             );
         }
+    }
+
+    fn linear_combination_f32(
+        &self,
+        x: &CudaStorage<f32>,
+        y: &CudaStorage<f32>,
+        alpha: f32,
+    ) -> CudaStorage<f32> {
+        assert_eq!(x.len(), y.len());
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::PushKernelArg;
+            let mut module = self.linear_combination_module.lock().unwrap();
+            if module.is_none() {
+                let ptx = cudarc::nvrtc::compile_ptx(LINEAR_COMBINATION_KERNEL_SRC)
+                    .expect("compile linear-combination kernel");
+                *module = Some(
+                    self.ctx
+                        .load_module(ptx)
+                        .expect("load linear-combination module"),
+                );
+            }
+            let function = module
+                .as_ref()
+                .unwrap()
+                .load_function("linear_combination")
+                .expect("load linear-combination function");
+            let mut output = self
+                .stream
+                .alloc_zeros::<f32>(x.len())
+                .expect("allocate linear-combination output");
+            if x.len() != 0 {
+                let n = x.len() as u64;
+                let mut builder = self.stream.launch_builder(&function);
+                builder
+                    .arg(&mut output)
+                    .arg(x.slice())
+                    .arg(y.slice())
+                    .arg(&alpha)
+                    .arg(&n);
+                let blocks = u32::try_from(x.len().div_ceil(256))
+                    .expect("linear-combination launch grid exceeds CUDA limits");
+                let config = cudarc::driver::LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { builder.launch(config) }.expect("launch linear-combination kernel");
+            }
+            return CudaStorage::new(output, self.stream.clone());
+        }
+        #[cfg(not(feature = "cuda"))]
+        panic!("CUDA linear combination requires the `cuda` feature")
     }
 
     fn copy_strided<T: Scalar>(

@@ -78,6 +78,24 @@ fn dense_modes(ia: &[usize], ib: &[usize], iy: &[usize]) -> (Vec<i32>, Vec<i32>,
     (modes_a, modes_b, modes_c)
 }
 
+impl<B: Backend> Tensor<f32, B> {
+    /// Return `self + alpha * other`, materializing non-contiguous inputs first.
+    ///
+    /// # Panics
+    /// Panics when the input shapes differ.
+    pub fn linear_combination(&self, other: &Self, alpha: f32) -> Self {
+        assert_eq!(self.shape(), other.shape(), "tensor shapes must match");
+        let x = self.contiguous();
+        let y = other.contiguous();
+        let storage = self.backend.linear_combination_f32(
+            x.storage().expect("contiguous tensor has storage"),
+            y.storage().expect("contiguous tensor has storage"),
+            alpha,
+        );
+        Self::from_storage(storage, self.shape(), self.backend.clone())
+    }
+}
+
 impl<T: Scalar, B: Backend> Tensor<T, B> {
     /// Binary tensor contraction using reshape-to-GEMM strategy.
     ///
@@ -283,6 +301,30 @@ mod tests {
     use super::*;
     use crate::algebra::Standard;
     use crate::backend::Cpu;
+
+    #[test]
+    fn linear_combination_computes_concrete_values() {
+        let x = Tensor::<f32, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let y = Tensor::<f32, Cpu>::from_data(&[4.0, 3.0, 2.0, 1.0], &[2, 2]);
+
+        assert_eq!(x.linear_combination(&y, 1.0).to_vec(), vec![5.0; 4]);
+        assert_eq!(
+            x.linear_combination(&y, -1.0).to_vec(),
+            vec![-3.0, -1.0, 1.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn linear_combination_materializes_non_contiguous_inputs() {
+        let x = Tensor::<f32, Cpu>::from_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let y = Tensor::<f32, Cpu>::from_data(&[6.0, 5.0, 4.0, 3.0, 2.0, 1.0], &[2, 3]);
+
+        let result = x
+            .permute(&[1, 0])
+            .linear_combination(&y.permute(&[1, 0]), -1.0);
+        assert_eq!(result.shape(), &[3, 2]);
+        assert_eq!(result.to_vec(), vec![-5.0, -1.0, 3.0, -3.0, 1.0, 5.0]);
+    }
 
     #[cfg(feature = "tropical")]
     use crate::algebra::MaxPlus;
