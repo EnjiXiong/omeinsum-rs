@@ -1,177 +1,147 @@
-//! Matched real-f32 tensor-network benchmark for one CUDA GPU or Ascend NPU.
-
+//! Execute every physical slice of a v2 Yao benchmark artifact.
 #[cfg(all(feature = "cuda", feature = "ascend"))]
-compile_error!("network_benchmark requires exactly one of `cuda` or `ascend`");
-
+compile_error!("select at most one accelerator feature");
 #[path = "support/yao_benchmark.rs"]
 mod format;
-
+#[path = "support/benchmark_runner.rs"]
+mod runner;
 use format::BenchmarkNetwork;
-use omeinsum::{Backend, Cpu, Standard};
-use std::{fs::File, hint::black_box, io::BufReader, time::Instant};
-
+use num_complex::Complex32;
+#[cfg(all(feature = "cuda", not(feature = "ascend")))]
+use omeinsum::backend::CudaComplex;
 #[cfg(all(feature = "ascend", not(feature = "cuda")))]
 use omeinsum::Ascend as Device;
 #[cfg(not(any(feature = "cuda", feature = "ascend")))]
 use omeinsum::Cpu as Device;
 #[cfg(all(feature = "cuda", not(feature = "ascend")))]
 use omeinsum::Cuda as Device;
+use omeinsum::{Backend, Cpu};
+use std::{fs::File, io::BufReader, time::Instant};
 
 struct Args {
     path: String,
+    representation: String,
     warmup: usize,
     repeats: usize,
-    check_cpu: bool,
+    check: bool,
 }
-
-fn parse_args() -> Args {
-    let mut args = std::env::args().skip(1);
-    let path = args
+fn args() -> Args {
+    let mut a = std::env::args().skip(1);
+    let path = a
         .next()
-        .unwrap_or_else(|| "benches/network_small.json".to_string());
-    let mut warmup = 3;
-    let mut repeats = 20;
-    let mut check_cpu = false;
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--check-cpu" => check_cpu = true,
-            "--warmup" | "--repeats" => {
-                let value = args.next().expect("flag requires a value");
-                match flag.as_str() {
-                    "--warmup" => warmup = value.parse().expect("--warmup requires an integer"),
-                    "--repeats" => repeats = value.parse().expect("--repeats requires an integer"),
-                    _ => unreachable!(),
-                }
-            }
-            _ => panic!("unknown flag {flag}"),
+        .unwrap_or_else(|| "benches/network_small.json".into());
+    let mut x = Args {
+        path,
+        representation: "tree-real".into(),
+        warmup: 3,
+        repeats: 20,
+        check: false,
+    };
+    while let Some(f) = a.next() {
+        match f.as_str() {
+            "--check-cpu" => x.check = true,
+            "--representation" => x.representation = a.next().expect("missing representation"),
+            "--warmup" => x.warmup = a.next().unwrap().parse().unwrap(),
+            "--repeats" => x.repeats = a.next().unwrap().parse().unwrap(),
+            _ => panic!("unknown option {f}"),
         }
     }
-    assert!(repeats > 0, "--repeats must be positive");
-    Args {
-        path,
-        warmup,
-        repeats,
-        check_cpu,
-    }
+    assert!(x.repeats > 0);
+    x
 }
-
 #[cfg(any(feature = "cuda", feature = "ascend"))]
 fn device() -> Device {
-    Device::new().expect("failed to initialize accelerator device 0")
+    Device::new().expect("failed to initialize device 0")
 }
-
 #[cfg(not(any(feature = "cuda", feature = "ascend")))]
 fn device() -> Device {
     Cpu
 }
-
-fn max_abs_error(expected: &[f32], actual: &[f32]) -> f32 {
-    assert_eq!(
-        expected.len(),
-        actual.len(),
-        "CPU/device result length mismatch"
-    );
-    expected
-        .iter()
-        .zip(actual)
-        .map(|(left, right)| (left - right).abs())
-        .fold(0.0f32, f32::max)
+fn cpu_reference(n: &BenchmarkNetwork) -> Complex32 {
+    let mut unsliced = n.clone();
+    unsliced.cuts.clear();
+    unsliced.assignment_count = 1;
+    let c = runner::native_cache(&unsliced, Cpu, Complex32::new);
+    runner::solve_native(&unsliced, &c, &Cpu)
 }
 
 fn main() {
-    let args = parse_args();
-    let reader = BufReader::new(
-        File::open(&args.path)
-            .unwrap_or_else(|error| panic!("failed to open {}: {error}", args.path)),
-    );
-    let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    deserializer.disable_recursion_limit();
-    let network: BenchmarkNetwork =
-        serde::Deserialize::deserialize(&mut deserializer).expect("invalid benchmark network JSON");
-    assert_eq!(network.format, "omeinsum-real-f32-benchmark-v1");
-    let einsum = network.einsum();
-
-    let expected = args.check_cpu.then(|| {
-        let tensors = network.tensors(Cpu);
-        let refs = tensors.iter().collect::<Vec<_>>();
-        einsum.execute::<Standard<f32>, f32, Cpu>(&refs).to_vec()
-    });
-
-    let device = device();
-    let tensors = network.tensors(device.clone());
-    let refs = tensors.iter().collect::<Vec<_>>();
-    let initial = einsum.execute::<Standard<f32>, f32, Device>(&refs);
-    device.synchronize();
-    let initial_values = initial.to_vec();
-    let error = expected
-        .as_ref()
-        .map(|values| max_abs_error(values, &initial_values));
-
-    for _ in 0..args.warmup {
-        let result = einsum.execute::<Standard<f32>, f32, Device>(&refs);
-        device.synchronize();
-        black_box(result);
+    let a = args();
+    let mut d = serde_json::Deserializer::from_reader(BufReader::new(File::open(&a.path).unwrap()));
+    d.disable_recursion_limit();
+    let n: BenchmarkNetwork = serde::Deserialize::deserialize(&mut d).expect("invalid artifact");
+    assert_eq!(n.format, "omeinsum-yao-benchmark-v2");
+    n.validate().expect("artifact validation failed");
+    let dev = device();
+    let run: Box<dyn Fn() -> Complex32> = match a.representation.as_str() {
+        "tree-real" => {
+            let cache = runner::real_cache(&n, dev.clone());
+            dev.synchronize();
+            let run_network = n.clone();
+            let run_device = dev.clone();
+            Box::new(move || runner::solve_real(&run_network, &cache, &run_device))
+        }
+        "native-complex" => native_run(&n, &dev),
+        _ => panic!("representation must be native-complex or tree-real"),
+    };
+    let initial = run();
+    let expected = a.check.then(|| cpu_reference(&n));
+    if let Some(e) = expected {
+        let err = (initial - e).norm();
+        assert!(
+            err <= 1e-4 + 1e-4 * e.norm(),
+            "CPU check failed: error={err}"
+        );
     }
-
-    let mut times_ms = Vec::with_capacity(args.repeats);
-    for _ in 0..args.repeats {
-        let start = Instant::now();
-        let result = einsum.execute::<Standard<f32>, f32, Device>(&refs);
-        device.synchronize();
-        times_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
-        black_box(result);
+    for _ in 0..a.warmup {
+        std::hint::black_box(run());
     }
-    times_ms.sort_by(f64::total_cmp);
-    let mean = times_ms.iter().sum::<f64>() / args.repeats as f64;
-    let median = times_ms[times_ms.len() / 2];
-    let checksum = initial_values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| (index + 1) as f64 * *value as f64)
-        .sum::<f64>();
-    assert!(
-        initial_values.iter().all(|value| value.is_finite()),
-        "device result contains a non-finite value"
-    );
-    println!(
-        "backend={} network={} tensors={} dtype=f32 scope=contraction warmup={} repeats={} cpu_check={} max_abs_error={}",
-        Device::name(),
-        args.path,
-        network.tensors.len(),
-        args.warmup,
-        args.repeats,
-        args.check_cpu,
-        error.map_or_else(|| "not-run".to_string(), |value| format!("{value:.9}"))
-    );
-    println!(
-        "complexity log2_flops={:.6} log2_peak_elements={:.6} estimated_peak_bytes_f32={:.0}",
-        network.complexity.log2_flops,
-        network.complexity.log2_peak_elements,
-        network.complexity.estimated_peak_bytes_f32
-    );
-    println!(
-        "result elements={} checksum={checksum:.12e}",
-        initial_values.len()
-    );
-    println!(
-        "result_values={}",
-        initial_values
-            .iter()
-            .map(|value| format!("{value:.12e}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let mut samples = Vec::new();
+    for _ in 0..a.repeats {
+        let t = Instant::now();
+        std::hint::black_box(run());
+        samples.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    let mut sorted = samples.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let median = if sorted.len() % 2 == 0 {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+    let audit = &n.tree_real_audit;
+    let u = &n.complexity.physical_unsliced;
+    let p = &n.complexity.physical_per_slice;
+    let total = &n.complexity.physical_total;
+    println!("backend={} network={} representation={} cuts={} assignments={} warmup={} repeats={} scope=synchronized-full-slice-solve",Device::name(),a.path,a.representation,n.cuts.iter().map(|x|x.to_string()).collect::<Vec<_>>().join(","),n.assignment_count,a.warmup,a.repeats);
+    println!("complexity unsliced_tc={:.6} unsliced_sc={:.6} unsliced_rwc={:.6} per_slice_tc={:.6} per_slice_sc={:.6} per_slice_rwc={:.6} total_tc={:.6} total_sc={:.6} total_rwc={:.6}",u.log2_flops,u.log2_peak_elements,u.log2_readwrites,p.log2_flops,p.log2_peak_elements,p.log2_readwrites,total.log2_flops,total.log2_peak_elements,total.log2_readwrites);
+    println!("tree_real pass={} ride={} merge={} pass_volume={} ride_volume={} merge_volume={} base_volume={} real_volume={} m={} r={} predicted_overhead={} native_contraction_sc_elements={} native_contraction_sc_bytes={} tree_real_logical_sc_elements={} tree_real_logical_sc_bytes={} native_resident_input_cache_elements={} native_resident_input_cache_bytes={} tree_real_resident_input_cache_elements={} tree_real_resident_input_cache_bytes={}",audit.pass_nodes,audit.ride_nodes,audit.merge_nodes,audit.pass_volume,audit.ride_volume,audit.merge_volume,audit.base_volume,audit.real_volume,audit.m,audit.r,audit.predicted_overhead,audit.native_contraction_sc_elements,audit.native_contraction_sc_bytes,audit.tree_real_logical_sc_elements,audit.tree_real_logical_sc_bytes,audit.native_resident_input_cache_elements,audit.native_resident_input_cache_bytes,audit.tree_real_resident_input_cache_elements,audit.tree_real_resident_input_cache_bytes);
+    println!("result_values={:.12e},{:.12e}", initial.re, initial.im);
     println!(
         "wall_clock_ms mean={mean:.6} median={median:.6} min={:.6} max={:.6}",
-        times_ms[0],
-        times_ms[times_ms.len() - 1]
+        sorted[0],
+        sorted[sorted.len() - 1]
     );
     println!(
         "samples_ms={}",
-        times_ms
+        samples
             .iter()
-            .map(|value| format!("{value:.6}"))
+            .map(|x| format!("{x:.6}"))
             .collect::<Vec<_>>()
             .join(",")
     );
+}
+
+#[cfg(not(feature = "ascend"))]
+fn native_run<'a>(n: &'a BenchmarkNetwork, d: &'a Device) -> Box<dyn Fn() -> Complex32 + 'a> {
+    #[cfg(feature = "cuda")]
+    let cache = runner::native_cache(n, d.clone(), CudaComplex::new);
+    #[cfg(not(feature = "cuda"))]
+    let cache = runner::native_cache(n, d.clone(), Complex32::new);
+    Box::new(move || runner::solve_native(n, &cache, d))
+}
+#[cfg(feature = "ascend")]
+fn native_run<'a>(_: &'a BenchmarkNetwork, _: &'a Device) -> Box<dyn Fn() -> Complex32 + 'a> {
+    panic!("native-complex is unsupported on Ascend")
 }
