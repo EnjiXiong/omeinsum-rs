@@ -1,11 +1,14 @@
 use clap::{Parser, Subcommand};
 
 mod autodiff;
+mod benchmark_plan;
 mod common;
 mod contract;
+mod execute_plan;
 mod format;
 mod optimize;
 mod parse;
+mod static_plan;
 mod yao_tn;
 
 #[derive(Parser)]
@@ -122,11 +125,80 @@ enum Commands {
         #[arg(long)]
         pretty: Option<bool>,
     },
-    /// Validate and normalize an optimized yao-tn-v1 scalar network
-    #[command(hide = true)]
+    /// Compile an optimized yao-tn-v1 scalar network into frozen real plans
     StaticPlan {
         /// Optimized yao-tn-v1 JSON file
         input: String,
+
+        /// Maximum imaginary magnitude for classifying a tensor as real
+        #[arg(long, default_value_t = 1e-12)]
+        realness_tol: f64,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Pretty-print JSON (default: auto-detect TTY)
+        #[arg(long)]
+        pretty: Option<bool>,
+    },
+    /// Execute prepared static plans once and emit untimed correctness outputs
+    ExecutePlan {
+        /// Frozen omeinsum-static-plan-v1 JSON file
+        plan: String,
+
+        /// Execution backend
+        #[arg(long, default_value = "cpu")]
+        backend: String,
+
+        /// Comma-separated representations
+        #[arg(long, default_value = "real-skeleton,flat-4m,realified-rank3")]
+        representations: String,
+
+        /// Floating-point dtype
+        #[arg(long, default_value = "f64")]
+        dtype: String,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Pretty-print JSON (default: auto-detect TTY)
+        #[arg(long)]
+        pretty: Option<bool>,
+    },
+    /// Benchmark reusable prepared static plans
+    BenchmarkPlan {
+        /// Frozen omeinsum-static-plan-v1 JSON file
+        plan: String,
+
+        /// Execution backend
+        #[arg(long, default_value = "cpu")]
+        backend: String,
+
+        /// Comma-separated representations
+        #[arg(long, default_value = "real-skeleton,flat-4m,realified-rank3")]
+        representations: String,
+
+        /// Floating-point dtype
+        #[arg(long, default_value = "f64")]
+        dtype: String,
+
+        /// Untimed warm-up rounds
+        #[arg(long, default_value_t = 3)]
+        warmups: usize,
+
+        /// Timed samples per representation
+        #[arg(long, default_value_t = 5)]
+        samples: usize,
+
+        /// Minimum duration used to calibrate each timed sample
+        #[arg(long, default_value_t = 200)]
+        min_sample_ms: u64,
+
+        /// Seed controlling per-round representation order
+        #[arg(long, default_value_t = 20260723)]
+        measurement_order_seed: u64,
 
         /// Output file (default: stdout)
         #[arg(short, long)]
@@ -204,9 +276,48 @@ fn main() {
         ),
         Commands::StaticPlan {
             input,
+            realness_tol,
             output,
             pretty,
-        } => yao_tn::run(&input, output.as_deref(), pretty),
+        } => static_plan::run(&input, realness_tol, output.as_deref(), pretty),
+        Commands::ExecutePlan {
+            plan,
+            backend,
+            representations,
+            dtype,
+            output,
+            pretty,
+        } => execute_plan::run(
+            &plan,
+            &backend,
+            &representations,
+            &dtype,
+            output.as_deref(),
+            pretty,
+        ),
+        Commands::BenchmarkPlan {
+            plan,
+            backend,
+            representations,
+            dtype,
+            warmups,
+            samples,
+            min_sample_ms,
+            measurement_order_seed,
+            output,
+            pretty,
+        } => benchmark_plan::run(
+            &plan,
+            &backend,
+            &representations,
+            &dtype,
+            warmups,
+            samples,
+            min_sample_ms,
+            measurement_order_seed,
+            output.as_deref(),
+            pretty,
+        ),
     };
 
     if let Err(err) = result {

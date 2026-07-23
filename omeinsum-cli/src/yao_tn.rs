@@ -30,13 +30,6 @@ struct YaoTensorNetworkDto {
     contraction_order: Option<NestedEinsumTree<i32>>,
 }
 
-pub(crate) fn run(input: &str, output: Option<&str>, pretty: Option<bool>) -> Result<(), String> {
-    let json = std::fs::read_to_string(input)
-        .map_err(|error| format!("Failed to read '{input}': {error}"))?;
-    let network = parse_yao_tn(&json).map_err(|error| error.to_string())?;
-    crate::common::write_json_output(&network, output, pretty)
-}
-
 pub(crate) fn parse_yao_tn(json: &str) -> Result<ComplexNetwork<f64>, PlanError> {
     let dto: YaoTensorNetworkDto = serde_json::from_str(json)
         .map_err(|error| PlanError::InvalidNetwork(format!("invalid JSON: {error}")))?;

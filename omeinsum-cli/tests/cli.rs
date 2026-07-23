@@ -146,11 +146,131 @@ fn static_plan_normalizes_optimized_yao_tn_without_changing_tree_order() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let normalized: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let root = &normalized["tree"]["Node"];
-    assert_eq!(root["output_modes"], serde_json::json!([]));
-    assert_eq!(root["left"]["Leaf"]["tensor_index"], 0);
-    assert_eq!(root["right"]["Leaf"]["tensor_index"], 1);
+    let bundle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root = &bundle["real_skeleton"]["nodes"][0];
+    assert_eq!(root["left"], 0);
+    assert_eq!(root["right"], 1);
+    assert_eq!(root["output"], 2);
+}
+
+fn build_static_plan_file() -> NamedTempFile {
+    let input = write_temp_json(&two_leaf_yao_tn().to_string());
+    let output = NamedTempFile::new().unwrap();
+    let result = cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--realness-tol",
+            "1e-12",
+            "--pretty",
+            "false",
+            "-o",
+            output.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    output
+}
+
+#[test]
+fn static_plan_builds_three_valid_hash_distinct_variants() {
+    let output = build_static_plan_file();
+    let json = std::fs::read_to_string(output.path()).unwrap();
+    let bundle: omeinsum::static_plan::PlanBundle = serde_json::from_str(&json).unwrap();
+    bundle.validate().unwrap();
+    assert_eq!(bundle.format, "omeinsum-static-plan-v1");
+    assert_eq!(bundle.tree_hash, bundle.real_skeleton.tree_hash);
+    assert_eq!(bundle.tree_hash, bundle.flat_4m.tree_hash);
+    assert_eq!(bundle.tree_hash, bundle.realified_rank3.tree_hash);
+    assert_ne!(bundle.real_skeleton.plan_hash, bundle.flat_4m.plan_hash);
+    assert_ne!(
+        bundle.real_skeleton.plan_hash,
+        bundle.realified_rank3.plan_hash
+    );
+    assert_ne!(bundle.flat_4m.plan_hash, bundle.realified_rank3.plan_hash);
+}
+
+#[test]
+fn execute_plan_emits_reference_and_three_untimed_outputs() {
+    let plan = build_static_plan_file();
+    let output = cmd()
+        .args([
+            "execute-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "cpu",
+            "--representations",
+            "real-skeleton,flat-4m,realified-rank3",
+            "--dtype",
+            "f64",
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["format"], "omeinsum-execution-check-v1");
+    assert_eq!(report["reference_complex64"]["re"], 11.0);
+    assert_eq!(report["executions"].as_array().unwrap().len(), 3);
+    assert!(report.get("timings").is_none());
+}
+
+#[test]
+fn benchmark_plan_emits_shortened_cpu_test_protocol() {
+    let plan = build_static_plan_file();
+    let output = cmd()
+        .args([
+            "benchmark-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "cpu",
+            "--representations",
+            "real-skeleton,flat-4m,realified-rank3",
+            "--dtype",
+            "f64",
+            "--warmups",
+            "1",
+            "--samples",
+            "1",
+            "--min-sample-ms",
+            "1",
+            "--measurement-order-seed",
+            "20260723",
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["format"], "omeinsum-benchmark-report-v1");
+    assert_eq!(report["reference_complex64"]["re"], 11.0);
+    assert_eq!(report["timings"].as_array().unwrap().len(), 3);
+    for timing in report["timings"].as_array().unwrap() {
+        assert_eq!(timing["warmups"], 1);
+        assert_eq!(timing["samples"], 1);
+        assert_eq!(
+            timing["raw_seconds_per_contraction"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
 
 #[test]
