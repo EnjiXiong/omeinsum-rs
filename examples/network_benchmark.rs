@@ -126,6 +126,10 @@ fn main() {
         .enumerate()
         .map(|(index, value)| (index + 1) as f64 * *value as f64)
         .sum::<f64>();
+    assert!(
+        initial_values.iter().all(|value| value.is_finite()),
+        "device result contains a non-finite value"
+    );
     println!(
         "backend={} network={} tensors={} dtype=f32 scope=contraction warmup={} repeats={} cpu_check={} max_abs_error={}",
         Device::name(),
@@ -145,6 +149,14 @@ fn main() {
     println!(
         "result elements={} checksum={checksum:.12e}",
         initial_values.len()
+    );
+    println!(
+        "result_values={}",
+        initial_values
+            .iter()
+            .map(|value| format!("{value:.12e}"))
+            .collect::<Vec<_>>()
+            .join(",")
     );
     println!(
         "wall_clock_ms mean={mean:.6} median={median:.6} min={:.6} max={:.6}",
