@@ -6,17 +6,17 @@
 
 #[cfg(all(feature = "cuda", feature = "ascend"))]
 compile_error!("network_benchmark requires exactly one of `cuda` or `ascend`");
-#[cfg(not(any(feature = "cuda", feature = "ascend")))]
-compile_error!("network_benchmark requires exactly one of `cuda` or `ascend`");
 
 use omeco::{EinCode, NestedEinsum};
 use omeinsum::{Backend, BackendScalar, Cpu, Einsum, Standard, Tensor};
 use serde::Deserialize;
 use std::{collections::HashMap, fs::File, hint::black_box, io::BufReader, time::Instant};
 
-#[cfg(feature = "ascend")]
+#[cfg(all(feature = "ascend", not(feature = "cuda")))]
 use omeinsum::Ascend as Device;
-#[cfg(feature = "cuda")]
+#[cfg(not(any(feature = "cuda", feature = "ascend")))]
+use omeinsum::Cpu as Device;
+#[cfg(all(feature = "cuda", not(feature = "ascend")))]
 use omeinsum::Cuda as Device;
 
 #[derive(Deserialize)]
@@ -107,6 +107,16 @@ where
         .collect()
 }
 
+#[cfg(any(feature = "cuda", feature = "ascend"))]
+fn device() -> Device {
+    Device::new().expect("failed to initialize accelerator device 0")
+}
+
+#[cfg(not(any(feature = "cuda", feature = "ascend")))]
+fn device() -> Device {
+    Cpu
+}
+
 fn main() {
     let (path, warmup, repeats) = parse_args();
     let network: NetworkJson = serde_json::from_reader(BufReader::new(
@@ -121,7 +131,7 @@ fn main() {
         .execute::<Standard<f32>, f32, Cpu>(&cpu_refs)
         .to_vec();
 
-    let device = Device::new().expect("failed to initialize accelerator device 0");
+    let device = device();
     let device_tensors = tensors(&network, device.clone());
     let device_refs = device_tensors.iter().collect::<Vec<_>>();
     let actual = einsum
