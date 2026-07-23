@@ -1,8 +1,10 @@
 use omeinsum::static_plan::{
-    build_geometry_plan, build_plan_bundle, BinaryContractionTree, ComplexNetwork, ComplexTensor,
-    InputSet, InputTensor, KernelKind, LeafClass, PlanBundle, PlanStats, Plane, Representation,
-    ScratchRole, StaticPlan, TensorSpec, ValueId, ValueSpec,
+    build_geometry_plan, build_plan_bundle, prepare_cpu_f32, prepare_cpu_f64,
+    BinaryContractionTree, ComplexNetwork, ComplexTensor, InputSet, InputTensor, KernelKind,
+    LeafClass, PlanBundle, PlanStats, Plane, Representation, ScratchRole, StaticPlan, TensorSpec,
+    ValueId, ValueSpec,
 };
+use rand::{Rng, SeedableRng};
 
 fn one_leaf_plan(
     representation: Representation,
@@ -109,6 +111,70 @@ fn two_leaf_scalar_network(left_imag: f64, right_imag: f64) -> ComplexNetwork<f6
             right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
         },
     }
+}
+
+fn matrix_scalar_network(left_imag: f64, right_imag: f64) -> ComplexNetwork<f64> {
+    ComplexNetwork {
+        tensors: vec![
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![0, 1],
+                    shape: vec![2, 2],
+                },
+                real: vec![1.0, 2.0, 3.0, 4.0],
+                imag: vec![left_imag, 0.5 * left_imag, 0.0, -left_imag],
+            },
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![1, 2],
+                    shape: vec![2, 2],
+                },
+                real: vec![0.5, -1.0, 2.0, 3.0],
+                imag: vec![right_imag, 0.0, -0.25 * right_imag, right_imag],
+            },
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![0, 2],
+                    shape: vec![2, 2],
+                },
+                real: vec![1.0, -0.5, 0.25, 2.0],
+                imag: vec![0.0; 4],
+            },
+        ],
+        output_modes: vec![],
+        size_dict: vec![(0, 2), (1, 2), (2, 2)],
+        tree: BinaryContractionTree::Node {
+            output_modes: vec![],
+            left: Box::new(BinaryContractionTree::Node {
+                output_modes: vec![0, 2],
+                left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+                right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
+            }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 2 }),
+        },
+    }
+}
+
+fn vector_chain_tree(leaves: usize) -> BinaryContractionTree {
+    assert!(leaves >= 2);
+    let first_output = if leaves == 2 { vec![] } else { vec![0] };
+    let mut tree = BinaryContractionTree::Node {
+        output_modes: first_output,
+        left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+        right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
+    };
+    for tensor_index in 2..leaves {
+        tree = BinaryContractionTree::Node {
+            output_modes: if tensor_index + 1 == leaves {
+                vec![]
+            } else {
+                vec![0]
+            },
+            left: Box::new(tree),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index }),
+        };
+    }
+    tree
 }
 
 #[test]
@@ -376,4 +442,227 @@ fn plan_accounting_invariants_and_validation_hold() {
         tree: BinaryContractionTree::Leaf { tensor_index: 0 },
     };
     assert!(build_plan_bundle(&leaf_only, 1e-12).is_err());
+}
+
+#[test]
+fn cpu_plane_kernels_match_hand_calculated_complex_matrices() {
+    for (left_imag, right_imag, expected_kind) in [
+        (0.0, 0.0, KernelKind::RealReal),
+        (0.75, 0.0, KernelKind::RideLeft),
+        (0.0, -0.5, KernelKind::RideRight),
+        (0.75, -0.5, KernelKind::Merge3M),
+    ] {
+        let network = matrix_scalar_network(left_imag, right_imag);
+        let bundle = build_plan_bundle(&network, 1e-12).unwrap();
+        assert_eq!(bundle.realified_rank3.nodes[0].kind, expected_kind);
+
+        let expected = {
+            let complex = |tensor: &ComplexTensor<f64>, index: usize| {
+                num_complex::Complex64::new(tensor.real[index], tensor.imag[index])
+            };
+            let mut result = num_complex::Complex64::new(0.0, 0.0);
+            for i in 0..2 {
+                for j in 0..2 {
+                    let mut product = num_complex::Complex64::new(0.0, 0.0);
+                    for k in 0..2 {
+                        product += complex(&network.tensors[0], i + 2 * k)
+                            * complex(&network.tensors[1], k + 2 * j);
+                    }
+                    result += product * complex(&network.tensors[2], i + 2 * j);
+                }
+            }
+            result
+        };
+
+        for plan in [&bundle.flat_4m, &bundle.realified_rank3] {
+            let mut executable = prepare_cpu_f64(plan, &bundle.inputs).unwrap();
+            executable.enqueue().unwrap();
+            executable.synchronize().unwrap();
+            let actual = executable.output().unwrap();
+            assert!((actual.re - expected.re).abs() <= 1e-12);
+            assert!((actual.im - expected.im).abs() <= 1e-12);
+        }
+    }
+
+    let bundle = build_plan_bundle(&matrix_scalar_network(0.5, -0.25), 1e-12).unwrap();
+    let mut oversized = bundle.inputs.clone();
+    oversized.tensors[0].real[0] = f64::MAX;
+    assert!(prepare_cpu_f32(&bundle.realified_rank3, &oversized).is_err());
+}
+
+#[test]
+fn cpu_random_realification_properties_cover_seeded_tree_shapes() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20260723);
+    for case in 0..100usize {
+        let leaves = 2 + case % 7;
+        let dimension = 1 + (case / 7) % 4;
+        let class_pattern = case % 4;
+        let mut tensors = Vec::with_capacity(leaves);
+        for leaf in 0..leaves {
+            let is_complex = match class_pattern {
+                0 => false,
+                1 => leaf == 0,
+                2 => leaf % 2 == 0,
+                _ => true,
+            };
+            let mut real = Vec::with_capacity(dimension);
+            let mut imag = Vec::with_capacity(dimension);
+            for _ in 0..dimension {
+                let magnitude = rng.random_range(0.2_f64..1.2);
+                let phase = if is_complex {
+                    rng.random_range(-std::f64::consts::PI..std::f64::consts::PI)
+                } else {
+                    0.0
+                };
+                let value = num_complex::Complex64::from_polar(magnitude, phase);
+                real.push(value.re);
+                imag.push(if is_complex && leaf % 2 == 1 {
+                    -value.im
+                } else {
+                    value.im
+                });
+            }
+            tensors.push(ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![0],
+                    shape: vec![dimension],
+                },
+                real,
+                imag,
+            });
+        }
+        let network = ComplexNetwork {
+            tensors,
+            output_modes: vec![],
+            size_dict: vec![(0, dimension)],
+            tree: vector_chain_tree(leaves),
+        };
+        let bundle = build_plan_bundle(&network, 1e-12).unwrap();
+        let reference = (0..dimension)
+            .map(|position| {
+                network
+                    .tensors
+                    .iter()
+                    .map(|tensor| {
+                        num_complex::Complex64::new(tensor.real[position], tensor.imag[position])
+                    })
+                    .product::<num_complex::Complex64>()
+            })
+            .sum::<num_complex::Complex64>();
+
+        for plan in [&bundle.flat_4m, &bundle.realified_rank3] {
+            let mut executable = prepare_cpu_f64(plan, &bundle.inputs).unwrap();
+            executable.enqueue().unwrap();
+            executable.synchronize().unwrap();
+            let actual = executable.output().unwrap();
+            let error = (num_complex::Complex64::new(actual.re, actual.im) - reference).norm();
+            assert!(
+                error <= 1e-12 + 1e-9 * reference.norm(),
+                "case {case}, {:?}: error {error}",
+                plan.representation
+            );
+
+            let mut executable = prepare_cpu_f32(plan, &bundle.inputs).unwrap();
+            executable.enqueue().unwrap();
+            executable.synchronize().unwrap();
+            let actual = executable.output().unwrap();
+            assert!(actual.re.is_finite() && actual.im.is_finite());
+            let scale = reference
+                .norm()
+                .max(2.0_f64.powf(-((case % 8 + 1) as f64) / 2.0));
+            let scaled_error =
+                (num_complex::Complex64::new(actual.re, actual.im) - reference).norm() / scale;
+            assert!(
+                scaled_error < 2e-5,
+                "case {case}, {:?}: scaled F32 error {scaled_error}",
+                plan.representation
+            );
+        }
+    }
+}
+
+#[test]
+fn cpu_frozen_geometry_honors_operand_and_output_permutations() {
+    let network = ComplexNetwork {
+        tensors: vec![
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![1, 0],
+                    shape: vec![3, 2],
+                },
+                real: vec![1.0, 2.0, -1.0, 0.5, 3.0, 4.0],
+                imag: vec![0.2, 0.0, -0.1, 0.3, 0.0, -0.4],
+            },
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![2, 1],
+                    shape: vec![4, 3],
+                },
+                real: (0..12).map(|value| value as f64 / 5.0 - 0.7).collect(),
+                imag: (0..12).map(|value| (value as f64 - 4.0) / 17.0).collect(),
+            },
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![2, 0],
+                    shape: vec![4, 2],
+                },
+                real: vec![1.0, 0.5, -0.5, 2.0, 0.25, -1.0, 1.5, 0.75],
+                imag: vec![0.0; 8],
+            },
+        ],
+        output_modes: vec![],
+        size_dict: vec![(0, 2), (1, 3), (2, 4)],
+        tree: BinaryContractionTree::Node {
+            output_modes: vec![],
+            left: Box::new(BinaryContractionTree::Node {
+                output_modes: vec![2, 0],
+                left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+                right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
+            }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 2 }),
+        },
+    };
+    let bundle = build_plan_bundle(&network, 1e-12).unwrap();
+    assert_eq!(
+        bundle.realified_rank3.nodes[0].contraction.left_permutation,
+        vec![1, 0]
+    );
+    assert_eq!(
+        bundle.realified_rank3.nodes[0]
+            .contraction
+            .right_permutation,
+        vec![1, 0]
+    );
+    assert_eq!(
+        bundle.realified_rank3.nodes[0]
+            .contraction
+            .output_permutation,
+        Some(vec![1, 0])
+    );
+
+    let complex = |tensor: usize, index: usize| {
+        num_complex::Complex64::new(
+            network.tensors[tensor].real[index],
+            network.tensors[tensor].imag[index],
+        )
+    };
+    let mut reference = num_complex::Complex64::new(0.0, 0.0);
+    for i in 0..2 {
+        for j in 0..4 {
+            let mut intermediate = num_complex::Complex64::new(0.0, 0.0);
+            for k in 0..3 {
+                intermediate += complex(0, k + 3 * i) * complex(1, j + 4 * k);
+            }
+            reference += intermediate * complex(2, j + 4 * i);
+        }
+    }
+
+    for plan in [&bundle.flat_4m, &bundle.realified_rank3] {
+        let mut executable = prepare_cpu_f64(plan, &bundle.inputs).unwrap();
+        executable.enqueue().unwrap();
+        executable.synchronize().unwrap();
+        let actual = executable.output().unwrap();
+        let error = (num_complex::Complex64::new(actual.re, actual.im) - reference).norm();
+        assert!(error <= 1e-12 + 1e-9 * reference.norm());
+    }
 }
