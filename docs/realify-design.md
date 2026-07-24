@@ -3,12 +3,13 @@
 **Status:** core implemented (M0–M2), with CPU and Ascend benchmark harnesses,
 M4 CLI support, final-only complex recovery, and an M5 feature-gated Ascend test.
 The 2026-07-22 Ascend study establishes correctness and the performance crossover.
-**M6 implemented (2026-07-23):** tree-following realification with the
-rank-3-factorized multiplication vertex — the ComplexTN.jl construction ported to
-Rust. The library transform, installed-tree execution and AD, `--realify-tree` CLI,
-and four-mode benchmark harness are implemented and locally verified. CPU/GPU/Ascend
-performance measurements remain gated on the external benchmark campaign (D10–D12,
-§1.6, §5 M6).
+**M6 implemented (2026-07-23), GPU/Ascend campaign complete (2026-07-24):**
+tree-following realification with the rank-3-factorized multiplication vertex — the
+ComplexTN.jl construction ported to Rust. The library transform, installed-tree
+execution and AD, `--realify-tree` CLI, and four-mode benchmark harness are verified.
+Matched A800/Ascend measurements show that `3 : 3 : 4` predicts core multiplication
+arithmetic, not wall time: the `4/3` dense/factorized ratio appears on the
+contraction-dominated Ascend case, but not on CUDA (§5 M6d).
 **Goal:** contract complex-valued tensor networks on backends without native complex
 support (today: Ascend, which is f32-only; also CUDA builds without cuTENSOR) by
 mechanically rewriting the network into an equivalent real-valued network, with no
@@ -600,7 +601,7 @@ labels only (green/rank labels are never cut).
 - Forward `execute` and `cost_and_gradient` both consume the installed tree; structural
   tests prove every merge is the intended four-step subtree.
 
-#### M6d — CLI + three-way benchmark + docs (implementation complete; hardware runs pending)
+#### M6d — CLI + three-way benchmark + docs (GPU/Ascend campaign complete)
 
 Files: `omeinsum-cli/src/{contract,autodiff}.rs`, `examples/network_benchmark.rs` +
 `examples/support/`, this document (status), NPUBenchmarkData manifest (separate repo change).
@@ -612,9 +613,26 @@ Files: `omeinsum-cli/src/{contract,autodiff}.rs`, `examples/network_benchmark.rs
   *static-factorized*, *static-dense*, and *native-complex* modes. Static-factorized
   uses the public M6 transform; static-dense is a benchmark-local tree transform so
   the diagnostic 4× path does not become public API. Sliced CPU parity tests pass.
-- Run the four modes on NPUBenchmarkData artifacts: CPU, CUDA, and Ascend (f32) behind
-  their feature flags, submitted per that repo's launcher rules. Report measured
-  ratios against the 3 : 3 : 4 prediction; this hardware campaign remains pending.
+- Matched CUDA/Ascend f32 runs used three immutable NPUBenchmarkData artifacts, their
+  exact archived trees, 3 warmups, and 10 synchronized full-solve repetitions. Every
+  timed configuration passed its CPU-native check. Durable samples and provenance are
+  in NPUBenchmarkData `results/m6-static-realification-v1/` at benchmark execution
+  commit `b604235ec86b24a0219ace7c469dd3a45b639469`; the tested omeinsum revision is
+  `61cd6b9adc6d7ae42aafda67c4979cd54233b403`.
+- Median dense/static-factorized ratios were CUDA `0.708`, `0.914` (bimodal;
+  inconclusive), `0.780`, and Ascend `0.812`, `0.787`, `1.367` for `test`,
+  rectangular-4x4-d16, and bristlecone-48-d16 respectively. Thus the arithmetic
+  `4/3` appears only in the contraction-dominated Ascend point: factorization cut
+  its dense median from `244.803 ms` to `179.036 ms` (26.9%). CUDA's robust points
+  favored dense static execution despite its fourth product.
+- Dispatch and static factorization are not wall-time-equivalent. On the substantive
+  CUDA cases dispatch beat static factorization; on Ascend static factorization beat
+  the current dispatch path. The latter alone required rank-greater-than-8 output
+  materialization through the host, so it is correctness evidence and current-backend
+  performance, not a lower bound for an all-device implementation. Three artifacts
+  do not establish a universal crossover threshold; profiling and another large
+  Ascend point are still warranted. A separate CPU performance sweep was not part of
+  this hardware request.
 
 ### M5 — stretch (each independent, do only when justified)
 
@@ -696,9 +714,14 @@ M6 implementation verification on 2026-07-23:
   for dispatch, static-factorized, static-dense, and native execution).
 - `make check` passed (format, clippy with tropical/parallel, 550 tests plus docs;
   11 known ignored unit tests and 4 ignored doctests).
-- Hardware performance results are not claimed here: the required runscribe recorder
-  is unavailable and NPUBenchmarkData requires committed, pinned, clean revisions
-  before remote GPU/NPU submission.
+- Matched final hardware runs completed on A800 (`m6-final-gpu-20260724`) and Ascend
+  910 (HPC4 Slurm job `109459`, exit `0:0`) from clean, pinned revisions. All 21 timed
+  configurations passed CPU checks. `isPANN/runscribe` was unavailable (upstream URLs
+  returned HTTP 404), so the predeclared NPUBenchmarkData manifest/provenance fallback
+  captured commits, input hashes, device inventories, commands, logs, and samples.
+- The Ascend campaign exposed and verified the rank-greater-than-8 output-permutation
+  fallback in `src/backend/ascend/contract.rs`; the final fail-fast run completed all
+  dispatch and static modes. See M6d for the scoped performance conclusion.
 
 ## 8. References
 
@@ -717,6 +740,7 @@ M6 implementation verification on 2026-07-23:
   (cost law 1+2m+r; flat-landscape result; 1555× fixed-wiring blow-up; Winograd
   rank-3 bound), `benchmarks/paper/{greensa,wallclock}.jl` (the green-aware SA and
   the three-executor race — the instruments behind D8's revision and D11).
-- NPUBenchmarkData `experiments/20260723-all-circuits-overlap-v1.yaml`: the
-  archived-tree + cuts artifact format M6 consumes, and the three-way benchmark's
-  target networks.
+- NPUBenchmarkData `experiments/20260724-m6-static-realification-v1.yaml` and
+  `results/m6-static-realification-v1/`: immutable M6 campaign definition, complete
+  samples, correctness comparisons, scoped conclusions, and provenance. The archived
+  artifact format originates in `experiments/20260723-all-circuits-overlap-v1.yaml`.
