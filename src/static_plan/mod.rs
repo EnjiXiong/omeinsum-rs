@@ -9,8 +9,8 @@ mod types;
 
 pub use arena::{allocate_live_ranges, plan_f32_arena, ArenaPlan, ArenaSlot, LiveRange};
 pub use ascend_lowering::{
-    coalesce_permutation, green_operand_plane_batches, lower_plan_traces, CoalescedPermutation,
-    LoweredNodeTrace,
+    coalesce_permutation, decompose_permutation, green_operand_plane_batches, lower_plan_traces,
+    CoalescedPermutation, LoweredNodeTrace,
 };
 pub use benchmark::*;
 pub use builder::{build_geometry_plan, build_plan_bundle};

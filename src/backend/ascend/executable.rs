@@ -1,8 +1,8 @@
 #![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
 
 use crate::static_plan::{
-    coalesce_permutation, lower_plan_traces, plan_f32_arena, ComplexValue, ExecutionError,
-    InputSet, KernelKind, PreparedExecutable, ScratchRole, StaticPlan, TensorSpec,
+    decompose_permutation, lower_plan_traces, plan_f32_arena, CoalescedPermutation, ComplexValue,
+    ExecutionError, InputSet, KernelKind, PreparedExecutable, ScratchRole, StaticPlan, TensorSpec,
 };
 
 use super::capture::{configure_capture, Capture, CaptureAttempt, CaptureRuntime};
@@ -33,13 +33,18 @@ struct LocalSlot {
 
 #[derive(Debug, Clone)]
 struct NodeResources {
-    left_desired: Vec<i32>,
-    right_desired: Vec<i32>,
     roles: Vec<(ScratchRole, LocalSlot)>,
-    left_pack: Option<LocalSlot>,
-    right_pack: Option<LocalSlot>,
+    left_permutation: Option<OperandPermutation>,
+    right_permutation: Option<OperandPermutation>,
     combine_temp: Option<LocalSlot>,
     bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OperandPermutation {
+    steps: Vec<CoalescedPermutation>,
+    pack: LocalSlot,
+    intermediate: Option<LocalSlot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,9 +109,7 @@ impl<'session> ExecutableState<'session> {
                 &semantic_arena,
                 &scratch,
                 &value_layouts[node.left.0],
-                &plan.values[node.left.0].tensor,
-                &resources.left_desired,
-                resources.left_pack,
+                resources.left_permutation.as_ref(),
                 node.id,
                 &mut steps,
             )?;
@@ -115,9 +118,7 @@ impl<'session> ExecutableState<'session> {
                 &semantic_arena,
                 &scratch,
                 &value_layouts[node.right.0],
-                &plan.values[node.right.0].tensor,
-                &resources.right_desired,
-                resources.right_pack,
+                resources.right_permutation.as_ref(),
                 node.id,
                 &mut steps,
             )?;
@@ -400,52 +401,24 @@ fn build_node_resources(
                 .chain(&node.contraction.right_modes)
                 .copied()
                 .collect::<Vec<_>>();
-            let left_pack = if layouts[node.left.0].physical_modes != left_desired {
-                validate_permutation_rank(
-                    &layouts[node.left.0],
-                    &plan.values[node.left.0].tensor,
-                    &left_desired,
-                )?;
-                Some(allocate_local(
-                    &mut cursor,
-                    layouts[node.left.0]
-                        .elements
-                        .checked_mul(layouts[node.left.0].planes)
-                        .ok_or_else(|| {
-                            ExecutionError::Unsupported(
-                                "left packing element count overflow".to_string(),
-                            )
-                        })?,
-                )?)
-            } else {
-                None
-            };
-            let right_pack = if layouts[node.right.0].physical_modes != right_desired {
-                validate_permutation_rank(
-                    &layouts[node.right.0],
-                    &plan.values[node.right.0].tensor,
-                    &right_desired,
-                )?;
-                Some(allocate_local(
-                    &mut cursor,
-                    layouts[node.right.0]
-                        .elements
-                        .checked_mul(layouts[node.right.0].planes)
-                        .ok_or_else(|| {
-                            ExecutionError::Unsupported(
-                                "right packing element count overflow".to_string(),
-                            )
-                        })?,
-                )?)
-            } else {
-                None
-            };
+            let left_permutation = build_operand_permutation(
+                &mut cursor,
+                &layouts[node.left.0],
+                &plan.values[node.left.0].tensor,
+                &left_desired,
+                "left",
+            )?;
+            let right_permutation = build_operand_permutation(
+                &mut cursor,
+                &layouts[node.right.0],
+                &plan.values[node.right.0].tensor,
+                &right_desired,
+                "right",
+            )?;
             Ok(NodeResources {
-                left_desired,
-                right_desired,
                 roles,
-                left_pack,
-                right_pack,
+                left_permutation,
+                right_permutation,
                 combine_temp,
                 bytes: cursor,
             })
@@ -453,22 +426,41 @@ fn build_node_resources(
         .collect()
 }
 
-fn validate_permutation_rank(
+fn build_operand_permutation(
+    cursor: &mut u64,
     layout: &ValueLayout,
     spec: &TensorSpec,
     desired: &[i32],
-) -> Result<(), ExecutionError> {
+    side: &str,
+) -> Result<Option<OperandPermutation>, ExecutionError> {
+    if layout.physical_modes == desired {
+        return Ok(None);
+    }
     let plane_rank = usize::from(layout.planes == 2);
     let rank_limit = 8usize
         .checked_sub(plane_rank)
         .ok_or_else(|| ExecutionError::Unsupported("invalid live ACLNN rank limit".to_string()))?;
-    coalesce_permutation(
+    let steps = decompose_permutation(
         &layout.physical_modes,
         desired,
         &dimensions(spec),
         rank_limit,
     )?;
-    Ok(())
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    let packed_elements = layout.elements.checked_mul(layout.planes).ok_or_else(|| {
+        ExecutionError::Unsupported(format!("{side} packing element count overflow"))
+    })?;
+    let pack = allocate_local(cursor, packed_elements)?;
+    let intermediate = (steps.len() > 1)
+        .then(|| allocate_local(cursor, packed_elements))
+        .transpose()?;
+    Ok(Some(OperandPermutation {
+        steps,
+        pack,
+        intermediate,
+    }))
 }
 
 fn allocate_local(cursor: &mut u64, elements: usize) -> Result<LocalSlot, ExecutionError> {
@@ -530,62 +522,87 @@ fn prepare_operand<'session>(
     arena: &DeviceBuffer<'session>,
     scratch: &DeviceBuffer<'session>,
     layout: &ValueLayout,
-    spec: &TensorSpec,
-    desired: &[i32],
-    pack: Option<LocalSlot>,
+    permutation: Option<&OperandPermutation>,
     node_id: usize,
     steps: &mut Vec<PreparedStep<'session>>,
 ) -> Result<OperandSource, ExecutionError> {
-    let source = OperandSource {
+    let mut source = OperandSource {
         buffer: BufferKind::Semantic,
         offset: layout.offset,
         elements: layout.elements,
         planes: layout.planes,
     };
-    let Some(pack) = pack else {
+    let Some(permutation) = permutation else {
         return Ok(source);
     };
-    let plane_rank = usize::from(layout.planes == 2);
-    let permutation = coalesce_permutation(
-        &layout.physical_modes,
-        desired,
-        &dimensions(spec),
-        8 - plane_rank,
-    )?;
-    let (input_shape, output_shape, axes) = if layout.planes == 2 {
-        let mut input_shape = vec![2];
-        input_shape.extend(permutation.input_shape);
-        let mut output_shape = vec![2];
-        output_shape.extend(permutation.output_shape);
-        let mut axes = vec![0];
-        axes.extend(permutation.axes.into_iter().map(|axis| axis + 1));
-        (input_shape, output_shape, axes)
-    } else {
-        (
-            permutation.input_shape,
-            permutation.output_shape,
-            permutation.axes,
-        )
-    };
-    let input = arena.tensor_f32(
-        source.offset,
-        &input_shape,
-        &row_major_strides(&input_shape)?,
-    )?;
-    let output = scratch.tensor_f32(
-        pack.offset,
-        &output_shape,
-        &row_major_strides(&output_shape)?,
-    )?;
-    steps.push(PreparedStep {
-        op: PreparedOp::permute(context, &input, &axes, &output, Some(node_id))?,
-    });
+    for (index, step) in permutation.steps.iter().enumerate() {
+        let destination = if (permutation.steps.len() - 1 - index) % 2 == 0 {
+            permutation.pack
+        } else {
+            permutation.intermediate.ok_or_else(|| {
+                ExecutionError::InvalidPlan(
+                    "multi-step Ascend permutation has no intermediate buffer".to_string(),
+                )
+            })?
+        };
+        let (input_shape, output_shape, axes) =
+            permutation_descriptor_geometry(step, layout.planes)?;
+        let input = buffer(source.buffer, arena, scratch).tensor_f32(
+            source.offset,
+            &input_shape,
+            &row_major_strides(&input_shape)?,
+        )?;
+        let output = scratch.tensor_f32(
+            destination.offset,
+            &output_shape,
+            &row_major_strides(&output_shape)?,
+        )?;
+        steps.push(PreparedStep {
+            op: PreparedOp::permute(context, &input, &axes, &output, Some(node_id))?,
+        });
+        source = OperandSource {
+            buffer: BufferKind::Scratch,
+            offset: destination.offset,
+            elements: layout.elements,
+            planes: layout.planes,
+        };
+    }
+    if source.offset != permutation.pack.offset {
+        return Err(ExecutionError::InvalidPlan(
+            "Ascend permutation did not finish in its packing buffer".to_string(),
+        ));
+    }
     Ok(OperandSource {
         buffer: BufferKind::Scratch,
-        offset: pack.offset,
+        offset: permutation.pack.offset,
         elements: layout.elements,
         planes: layout.planes,
     })
+}
+
+fn permutation_descriptor_geometry(
+    permutation: &CoalescedPermutation,
+    planes: usize,
+) -> Result<(Vec<usize>, Vec<usize>, Vec<i64>), ExecutionError> {
+    if planes == 2 {
+        let mut input_shape = vec![2];
+        input_shape.extend(&permutation.input_shape);
+        let mut output_shape = vec![2];
+        output_shape.extend(&permutation.output_shape);
+        let mut axes = vec![0];
+        axes.extend(permutation.axes.iter().map(|axis| axis + 1));
+        Ok((input_shape, output_shape, axes))
+    } else if planes == 1 {
+        Ok((
+            permutation.input_shape.clone(),
+            permutation.output_shape.clone(),
+            permutation.axes.clone(),
+        ))
+    } else {
+        Err(ExecutionError::InvalidPlan(format!(
+            "Ascend permutation received unsupported plane count {planes}"
+        )))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

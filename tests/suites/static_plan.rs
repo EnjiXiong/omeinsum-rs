@@ -1,10 +1,11 @@
 use omeinsum::static_plan::{
     allocate_live_ranges, benchmark_prepared, build_geometry_plan, build_plan_bundle,
-    coalesce_permutation, contract_complex64, green_operand_plane_batches, lower_plan_traces,
-    plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, ArenaSlot, BenchmarkConfig, BenchmarkTarget,
-    BinaryContractionTree, ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet,
-    InputTensor, KernelKind, LeafClass, LiveRange, PlanBundle, PlanStats, Plane,
-    PreparedExecutable, Representation, ScratchRole, StaticPlan, TensorSpec, ValueId, ValueSpec,
+    coalesce_permutation, contract_complex64, decompose_permutation, green_operand_plane_batches,
+    lower_plan_traces, plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, ArenaSlot,
+    BenchmarkConfig, BenchmarkTarget, BinaryContractionTree, ComplexNetwork, ComplexTensor,
+    ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind, LeafClass, LiveRange,
+    PlanBundle, PlanStats, Plane, PreparedExecutable, Representation, ScratchRole, StaticPlan,
+    TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Mutex};
@@ -1144,22 +1145,125 @@ fn ascend_lowering_rank3_and_flat_have_exact_real_operator_counts() {
 }
 
 #[test]
-fn ascend_lowering_coalesces_high_rank_permutations_or_rejects_them_explicitly() {
+fn ascend_lowering_preserves_the_single_permute_fast_path() {
     let dimensions = (0..10).map(|mode| (mode, 2)).collect::<Vec<_>>();
-    let collapsed = coalesce_permutation(
-        &(0..10).collect::<Vec<_>>(),
-        &[6, 7, 8, 9, 2, 3, 4, 5, 0, 1],
-        &dimensions,
-        8,
-    )
-    .unwrap();
+    let current = (0..10).collect::<Vec<_>>();
+    let desired = [6, 7, 8, 9, 2, 3, 4, 5, 0, 1];
+    let collapsed = coalesce_permutation(&current, &desired, &dimensions, 8).unwrap();
     assert_eq!(collapsed.input_shape, vec![4, 16, 16]);
     assert_eq!(collapsed.axes, vec![2, 1, 0]);
     assert_eq!(collapsed.output_shape, vec![16, 16, 4]);
 
-    let error = coalesce_permutation(
+    let steps = decompose_permutation(&current, &desired, &dimensions, 8).unwrap();
+    assert_eq!(steps, vec![collapsed]);
+}
+
+#[test]
+fn ascend_lowering_decomposes_an_over_rank_permutation_into_bounded_block_moves() {
+    let dimensions = (0..12).map(|mode| (mode, 2)).collect::<Vec<_>>();
+    let current = (0..12).collect::<Vec<_>>();
+    let desired = [0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11];
+
+    let direct_error = coalesce_permutation(&current, &desired, &dimensions, 8).unwrap_err();
+    assert!(matches!(direct_error, ExecutionError::Unsupported(_)));
+
+    let steps = decompose_permutation(&current, &desired, &dimensions, 8).unwrap();
+    assert!(steps.len() > 1);
+    assert!(steps.iter().all(|step| {
+        step.input_shape.len() <= 4
+            && step.axes.len() == step.input_shape.len()
+            && step.output_shape.len() == step.input_shape.len()
+            && step.input_shape.iter().product::<usize>()
+                == step.output_shape.iter().product::<usize>()
+    }));
+    assert_eq!(
+        replay_permutation_modes(&current, &dimensions, &steps),
+        desired
+    );
+}
+
+#[test]
+fn ascend_lowering_decomposition_replays_seeded_arbitrary_mode_orders() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x0A5C_E910);
+    for rank in 2..=16 {
+        let dimensions = (0..rank).map(|mode| (mode, 2)).collect::<Vec<_>>();
+        let current = (0..rank).collect::<Vec<_>>();
+        for _ in 0..32 {
+            let mut desired = current.clone();
+            for index in (1..desired.len()).rev() {
+                desired.swap(index, rng.random_range(0..=index));
+            }
+            let steps = decompose_permutation(&current, &desired, &dimensions, 7).unwrap();
+            assert!(steps.iter().all(|step| step.input_shape.len() <= 7));
+            assert_eq!(
+                replay_permutation_modes(&current, &dimensions, &steps),
+                desired
+            );
+        }
+    }
+}
+
+#[test]
+fn ascend_lowering_omits_identity_and_singleton_axes_from_decomposition() {
+    let dimensions = vec![(0, 2), (1, 1), (2, 3), (3, 1), (4, 5)];
+    let identity =
+        decompose_permutation(&[0, 1, 2, 3, 4], &[0, 1, 2, 3, 4], &dimensions, 8).unwrap();
+    assert!(identity.is_empty());
+
+    let steps = decompose_permutation(&[0, 1, 2, 3, 4], &[4, 3, 2, 1, 0], &dimensions, 8).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].input_shape, vec![2, 3, 5]);
+    assert_eq!(steps[0].axes, vec![2, 1, 0]);
+    assert_eq!(steps[0].output_shape, vec![5, 3, 2]);
+}
+
+fn replay_permutation_modes(
+    initial_modes: &[i32],
+    dimensions: &[(i32, usize)],
+    steps: &[omeinsum::static_plan::CoalescedPermutation],
+) -> Vec<i32> {
+    let sizes = dimensions
+        .iter()
+        .copied()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut modes = initial_modes
+        .iter()
+        .copied()
+        .filter(|mode| sizes[mode] != 1)
+        .collect::<Vec<_>>();
+    for step in steps {
+        let mut groups = Vec::with_capacity(step.input_shape.len());
+        let mut cursor = 0usize;
+        for expected_size in &step.input_shape {
+            let mut product = 1usize;
+            let start = cursor;
+            while product < *expected_size {
+                product *= sizes[&modes[cursor]];
+                cursor += 1;
+            }
+            assert_eq!(product, *expected_size);
+            groups.push(modes[start..cursor].to_vec());
+        }
+        assert_eq!(cursor, modes.len());
+        modes = step
+            .axes
+            .iter()
+            .flat_map(|axis| groups[*axis as usize].iter().copied())
+            .collect();
+    }
+    modes
+}
+
+#[test]
+fn ascend_lowering_rejects_mismatched_permutation_modes() {
+    let dimensions = (0..10).map(|mode| (mode, 2)).collect::<Vec<_>>();
+    let rank_error =
+        decompose_permutation(&[0, 1], &[0], &dimensions, 8).expect_err("rank change must fail");
+    assert!(matches!(rank_error, ExecutionError::Unsupported(_)));
+
+    let error = decompose_permutation(
         &(0..10).collect::<Vec<_>>(),
-        &[0, 2, 4, 6, 8, 1, 3, 5, 7, 9],
+        &[0, 2, 4, 6, 8, 1, 3, 5, 7, 99],
         &dimensions,
         8,
     )

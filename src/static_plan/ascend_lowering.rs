@@ -169,6 +169,146 @@ pub fn coalesce_permutation(
     })
 }
 
+/// Lowers a logical mode permutation to one or more bounded-rank block
+/// permutations.
+///
+/// The existing single-permute coalescing path remains the fast path. When its
+/// coalesced rank exceeds `rank_limit`, each fallback step moves one contiguous
+/// target block forward and therefore has at most four axes.
+pub fn decompose_permutation(
+    current_modes: &[i32],
+    desired_modes: &[i32],
+    dimensions: &[(i32, usize)],
+    rank_limit: usize,
+) -> Result<Vec<CoalescedPermutation>, ExecutionError> {
+    if current_modes.len() != desired_modes.len() {
+        return Err(ExecutionError::Unsupported(format!(
+            "permutation changes rank {} to {}",
+            current_modes.len(),
+            desired_modes.len()
+        )));
+    }
+    let sizes = dimensions
+        .iter()
+        .copied()
+        .collect::<std::collections::HashMap<_, _>>();
+    let filter_singletons = |modes: &[i32]| {
+        modes
+            .iter()
+            .copied()
+            .filter_map(|mode| match sizes.get(&mode) {
+                Some(1) => None,
+                Some(_) => Some(Ok(mode)),
+                None => Some(Err(ExecutionError::Unsupported(format!(
+                    "mode {mode} is missing from permutation dimensions"
+                )))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let mut current = filter_singletons(current_modes)?;
+    let desired = filter_singletons(desired_modes)?;
+    let mut sorted_current = current.clone();
+    let mut sorted_desired = desired.clone();
+    sorted_current.sort_unstable();
+    sorted_desired.sort_unstable();
+    if sorted_current != sorted_desired {
+        return Err(ExecutionError::Unsupported(
+            "permutation mode sets differ".to_string(),
+        ));
+    }
+    if current == desired {
+        return Ok(vec![]);
+    }
+    if sorted_current.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ExecutionError::Unsupported(
+            "permutation modes must be unique".to_string(),
+        ));
+    }
+
+    let direct = coalesce_permutation(&current, &desired, dimensions, usize::MAX)?;
+    if direct.input_shape.len() <= rank_limit {
+        return Ok(vec![direct]);
+    }
+    if rank_limit < 4 {
+        return Err(ExecutionError::Unsupported(format!(
+            "permutation requires block decomposition, but live rank limit {rank_limit} is below 4"
+        )));
+    }
+
+    let mut steps = Vec::new();
+    while current != desired {
+        let first_mismatch = current
+            .iter()
+            .zip(&desired)
+            .position(|(current, desired)| current != desired)
+            .expect("different mode orders have a first mismatch");
+        let selected_start = current[first_mismatch + 1..]
+            .iter()
+            .position(|mode| *mode == desired[first_mismatch])
+            .map(|offset| first_mismatch + 1 + offset)
+            .ok_or_else(|| {
+                ExecutionError::Unsupported(
+                    "permutation mode sets changed during decomposition".to_string(),
+                )
+            })?;
+        let selected_len = current[selected_start..]
+            .iter()
+            .zip(&desired[first_mismatch..])
+            .take_while(|(current, desired)| current == desired)
+            .count();
+
+        let mut groups = Vec::<Vec<i32>>::with_capacity(4);
+        let mut prefix = None;
+        if first_mismatch != 0 {
+            prefix = Some(groups.len());
+            groups.push(current[..first_mismatch].to_vec());
+        }
+        let middle = groups.len();
+        groups.push(current[first_mismatch..selected_start].to_vec());
+        let selected = groups.len();
+        groups.push(current[selected_start..selected_start + selected_len].to_vec());
+        let mut suffix = None;
+        if selected_start + selected_len != current.len() {
+            suffix = Some(groups.len());
+            groups.push(current[selected_start + selected_len..].to_vec());
+        }
+        debug_assert!(groups.len() <= 4);
+
+        let input_shape = groups
+            .iter()
+            .map(|group| checked_group_size(group, &sizes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let axes = prefix
+            .into_iter()
+            .chain(std::iter::once(selected))
+            .chain(std::iter::once(middle))
+            .chain(suffix)
+            .map(|axis| {
+                i64::try_from(axis).map_err(|_| {
+                    ExecutionError::Unsupported(
+                        "decomposed permutation axis exceeds i64".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_shape = axes
+            .iter()
+            .map(|axis| input_shape[*axis as usize])
+            .collect::<Vec<_>>();
+        steps.push(CoalescedPermutation {
+            input_shape,
+            axes,
+            output_shape,
+        });
+
+        let selected_modes = current
+            .drain(selected_start..selected_start + selected_len)
+            .collect::<Vec<_>>();
+        current.splice(first_mismatch..first_mismatch, selected_modes);
+    }
+    Ok(steps)
+}
+
 fn checked_group_size(
     group: &[i32],
     sizes: &std::collections::HashMap<i32, usize>,
