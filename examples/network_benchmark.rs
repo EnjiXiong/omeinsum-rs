@@ -74,15 +74,31 @@ fn main() {
     n.validate().expect("artifact validation failed");
     let dev = device();
     let run: Box<dyn Fn() -> Complex32> = match a.representation.as_str() {
-        "tree-real" => {
+        "tree-real" | "dispatch" => {
             let cache = runner::real_cache(&n, dev.clone());
             dev.synchronize();
             let run_network = n.clone();
             let run_device = dev.clone();
             Box::new(move || runner::solve_real(&run_network, &cache, &run_device))
         }
+        "static-factorized" => {
+            let prepared = runner::static_factorized(&n, dev.clone());
+            dev.synchronize();
+            let run_network = n.clone();
+            let run_device = dev.clone();
+            Box::new(move || runner::solve_static(&run_network, &prepared, &run_device))
+        }
+        "static-dense" => {
+            let prepared = runner::static_dense(&n, dev.clone());
+            dev.synchronize();
+            let run_network = n.clone();
+            let run_device = dev.clone();
+            Box::new(move || runner::solve_static(&run_network, &prepared, &run_device))
+        }
         "native-complex" => native_run(&n, &dev),
-        _ => panic!("representation must be native-complex or tree-real"),
+        _ => panic!(
+            "representation must be native-complex, tree-real/dispatch, static-factorized, or static-dense"
+        ),
     };
     let initial = run();
     let expected = a.check.then(|| cpu_reference(&n));
