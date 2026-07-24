@@ -31,7 +31,12 @@ struct YaoTensorNetworkDto {
 }
 
 pub(crate) fn parse_yao_tn(json: &str) -> Result<ComplexNetwork<f64>, PlanError> {
-    let dto: YaoTensorNetworkDto = serde_json::from_str(json)
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    deserializer.disable_recursion_limit();
+    let dto = YaoTensorNetworkDto::deserialize(serde_stacker::Deserializer::new(&mut deserializer))
+        .map_err(|error| PlanError::InvalidNetwork(format!("invalid JSON: {error}")))?;
+    deserializer
+        .end()
         .map_err(|error| PlanError::InvalidNetwork(format!("invalid JSON: {error}")))?;
     if dto.format != "yao-tn-v1" {
         return Err(PlanError::InvalidFormat(format!(

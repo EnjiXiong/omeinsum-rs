@@ -50,6 +50,46 @@ fn two_leaf_yao_tn() -> serde_json::Value {
     })
 }
 
+fn deep_scalar_chain_yao_tn(internal_nodes: usize) -> serde_json::Value {
+    let mut tree = serde_json::json!({"isleaf": true, "tensorindex": 0});
+    for tensor_index in 1..=internal_nodes {
+        tree = serde_json::json!({
+            "isleaf": false,
+            "args": [
+                tree,
+                {"isleaf": true, "tensorindex": tensor_index},
+            ],
+            "eins": {
+                "ixs": [[], []],
+                "iy": [],
+            },
+        });
+    }
+    let input_indices = (0..=internal_nodes)
+        .map(|_| serde_json::json!([]))
+        .collect::<Vec<_>>();
+    let tensors = (0..=internal_nodes)
+        .map(|_| {
+            serde_json::json!({
+                "shape": [],
+                "data_re": [1.0],
+                "data_im": [0.0],
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "format": "yao-tn-v1",
+        "mode": "overlap",
+        "eincode": {
+            "input_indices": input_indices,
+            "output_indices": [],
+        },
+        "tensors": tensors,
+        "size_dict": {},
+        "contraction_order": tree,
+    })
+}
+
 fn assert_static_plan_rejected(json: &serde_json::Value, case: &str) {
     let input = write_temp_json(&json.to_string());
     let output = cmd()
@@ -151,6 +191,32 @@ fn static_plan_normalizes_optimized_yao_tn_without_changing_tree_order() {
     assert_eq!(root["left"], 0);
     assert_eq!(root["right"], 1);
     assert_eq!(root["output"], 2);
+}
+
+#[test]
+fn static_plan_accepts_deep_optimized_yao_tn() {
+    let internal_nodes = 130;
+    let input = write_temp_json(&deep_scalar_chain_yao_tn(internal_nodes).to_string());
+    let output = cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bundle: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        bundle["real_skeleton"]["nodes"].as_array().unwrap().len(),
+        internal_nodes
+    );
 }
 
 fn build_static_plan_file() -> NamedTempFile {
