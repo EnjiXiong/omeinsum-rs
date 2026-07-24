@@ -780,11 +780,23 @@ where
     c
 }
 
+#[inline]
+fn faer_parallelism() -> faer::Par {
+    #[cfg(feature = "parallel")]
+    {
+        faer::Par::rayon(0)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        faer::Par::Seq
+    }
+}
+
 fn faer_gemm_layout_into<T>(a: MatrixLayout<'_, T>, b: MatrixLayout<'_, T>, c: &mut [T])
 where
     T: faer::traits::ComplexField + Copy,
 {
-    use faer::{linalg::matmul::matmul, Accum, MatMut, Par};
+    use faer::{linalg::matmul::matmul, Accum, MatMut};
 
     assert_eq!(c.len(), a.rows * b.cols);
     let a_mat = faer_mat_ref(a);
@@ -797,7 +809,7 @@ where
         a_mat,
         b_mat,
         faer::traits::math_utils::one::<T>(),
-        Par::Seq,
+        faer_parallelism(),
     );
 }
 
@@ -1177,6 +1189,18 @@ fn try_tropical_gemm_with_argmax<A: Algebra<Index = u32>>(
 mod tests {
     use super::*;
     use crate::algebra::Standard;
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn faer_parallel_feature_uses_the_rayon_pool() {
+        assert!(matches!(faer_parallelism(), faer::Par::Rayon(_)));
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    #[test]
+    fn faer_default_build_remains_sequential() {
+        assert_eq!(faer_parallelism(), faer::Par::Seq);
+    }
 
     fn generic_batched_gemm_for_test<A: Algebra>(
         a: &[A::Scalar],
