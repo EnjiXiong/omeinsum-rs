@@ -8,7 +8,8 @@ use std::{collections::HashMap, fs::File, io::BufReader};
 struct Args {
     input: String,
     output: String,
-    sc: f64,
+    optimizer_sc: f64,
+    slicer_sc: f64,
     max: usize,
     opt_profile: String,
     opt_trials: usize,
@@ -25,7 +26,12 @@ fn args() -> Args {
     let mut x = Args {
         input,
         output,
-        sc: 28.0,
+        // The optimizer's sc target shapes the tree search; it must not exclude
+        // good high-sc trees (the paper's Table-1 trees reach sc = 35). Memory
+        // is enforced by the slicer below, not by the optimizer.
+        optimizer_sc: 40.0,
+        // Per-slice peak: 2^26 f32 elements = 256 MiB (tree-real 2x -> ~512 MiB).
+        slicer_sc: 26.0,
         max: 1 << 24,
         opt_profile: "fast".into(),
         opt_trials: 1,
@@ -36,7 +42,13 @@ fn args() -> Args {
     while let Some(f) = a.next() {
         let v = a.next().unwrap_or_else(|| panic!("{f} requires a value"));
         match f.as_str() {
-            "--sc-target" => x.sc = v.parse().unwrap(),
+            "--sc-target" => {
+                eprintln!("warning: --sc-target constrains BOTH optimizer and slicer; prefer --optimizer-sc-target and --slicer-sc-target");
+                x.optimizer_sc = v.parse().unwrap();
+                x.slicer_sc = x.optimizer_sc;
+            }
+            "--optimizer-sc-target" => x.optimizer_sc = v.parse().unwrap(),
+            "--slicer-sc-target" => x.slicer_sc = v.parse().unwrap(),
             "--max-assignments" => x.max = v.parse().unwrap(),
             "--optimizer-profile" => x.opt_profile = v,
             "--optimizer-trials" => x.opt_trials = v.parse().unwrap(),
@@ -124,13 +136,13 @@ fn main() {
     }
     .with_ntrials(a.opt_trials)
     .with_niters(a.opt_iters)
-    .with_sc_target(a.sc);
+    .with_sc_target(a.optimizer_sc);
     let original = optimize_code(&code, &sizes, &optimizer).expect("TreeSA produced no tree");
     let unsliced = contraction_complexity(&original, &sizes, &ixs);
     let slicer = TreeSASlicer::fast()
         .with_ntrials(a.slice_trials)
         .with_niters(a.slice_iters)
-        .with_sc_target(a.sc);
+        .with_sc_target(a.slicer_sc);
     let sliced = slice_code(&original, &sizes, &slicer, &ixs).expect("TreeSASlicer failed");
     let mut cuts = sliced.slicing;
     cuts.sort_unstable();
@@ -190,14 +202,14 @@ fn main() {
             version: "0.2.6".into(),
             ntrials: a.opt_trials,
             niters: a.opt_iters,
-            sc_target: a.sc,
+            sc_target: a.optimizer_sc,
             seed_base: 42,
         },
         slicer: SlicerConfig {
             algorithm: "omeco::TreeSASlicer".into(),
             ntrials: a.slice_trials,
             niters: a.slice_iters,
-            sc_target: a.sc,
+            sc_target: a.slicer_sc,
             optimization_ratio: 1.0,
             seed_base: 42,
         },
