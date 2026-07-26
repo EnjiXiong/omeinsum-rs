@@ -25,7 +25,7 @@ faer = "0.24"
 
 # Contraction order optimization. Pinned to exAClior/omeco (green-sa branch)
 # for the GreenAnnealer second-stage optimizer (RealifyTN campaign W2).
-omeco = { git = "https://github.com/exAClior/omeco.git", rev = "a29b18d3b1ea07fe1b9c46c359b2fdd0d26ca6af" }
+omeco = { git = "https://github.com/exAClior/omeco.git", rev = "994edd78b29111a444c09e37568b76231423f613" }
 
 # Optional: Tropical algebra support. tropical-gemm and tropical-gemm-cuda must
 # resolve to the same crate version so the CPU and GPU tropical paths share one
