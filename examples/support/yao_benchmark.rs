@@ -23,11 +23,19 @@ pub struct YaoTensor {
     pub data_im: Vec<f64>,
 }
 
+fn default_dtype() -> String {
+    "f32".into()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BenchmarkNetwork {
     pub format: String,
     pub source_format: String,
     pub source_mode: String,
+    // W4: artifact scalar dtype ("f32" default; "c64" keeps the yao-TN's f64
+    // gate data for the native-complex reference runs).
+    #[serde(default = "default_dtype")]
+    pub dtype: String,
     pub optimizer: OptimizerConfig,
     pub slicer: SlicerConfig,
     pub eincode: BenchmarkEinCode,
@@ -79,8 +87,16 @@ pub struct BenchmarkEinCode {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BenchmarkTensor {
     pub shape: Vec<usize>,
+    // W4: f32 payloads are empty when the artifact dtype is c64 (the f64
+    // arrays below carry the data); serde defaults keep this readable.
+    #[serde(default)]
     pub data_re: Vec<f32>,
+    #[serde(default)]
     pub data_im: Vec<f32>,
+    #[serde(default)]
+    pub data_re_f64: Option<Vec<f64>>,
+    #[serde(default)]
+    pub data_im_f64: Option<Vec<f64>>,
     pub structurally_complex: bool,
 }
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -206,8 +222,24 @@ impl BenchmarkNetwork {
                 }
             }
             let elements = tensor.shape.iter().product::<usize>();
-            if tensor.data_re.len() != elements || tensor.data_im.len() != elements {
-                return Err(format!("leaf {i} data length does not match its shape"));
+            match self.dtype.as_str() {
+                "c64" => {
+                    let (re, im) = tensor
+                        .data_re_f64
+                        .as_ref()
+                        .zip(tensor.data_im_f64.as_ref())
+                        .ok_or_else(|| format!("leaf {i} is missing its c64 payload"))?;
+                    if re.len() != elements || im.len() != elements {
+                        return Err(format!(
+                            "leaf {i} c64 data length does not match its shape"
+                        ));
+                    }
+                }
+                _ => {
+                    if tensor.data_re.len() != elements || tensor.data_im.len() != elements {
+                        return Err(format!("leaf {i} data length does not match its shape"));
+                    }
+                }
             }
         }
         fn validate_labels(

@@ -1,5 +1,5 @@
 use super::format::{slice_column_major, BenchmarkNetwork, TreeNode};
-use num_complex::Complex32;
+use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
 use omeco::{EinCode, NestedEinsum};
 use omeinsum::algebra::Scalar;
@@ -561,6 +561,66 @@ where
         im.add(c.im as f64)
     }
     Complex32::new(re.sum as f32, im.sum as f32)
+}
+
+// W4: c64 mirrors of native_cache/solve_native for the f64 reference runs.
+// They read the artifact's f64 payloads and never downcast; the f32 path
+// above is untouched.
+pub fn native_cache_c64<T, B: Backend + Clone, F: Fn(f64, f64) -> T>(
+    network: &BenchmarkNetwork,
+    backend: B,
+    make: F,
+) -> Vec<Vec<Tensor<T, B>>>
+where
+    T: Scalar + BackendScalar<B>,
+{
+    network
+        .tensors
+        .iter()
+        .zip(&network.eincode.input_indices)
+        .map(|(t, ix)| {
+            let re = t.data_re_f64.as_ref().expect("missing c64 payload");
+            let im = t.data_im_f64.as_ref().expect("missing c64 payload");
+            let data = re
+                .iter()
+                .zip(im)
+                .map(|(&r, &i)| make(r, i))
+                .collect::<Vec<_>>();
+            local_assignments(network, ix)
+                .iter()
+                .map(|a| {
+                    let (v, shape) = slice_column_major(&data, &t.shape, ix, a);
+                    Tensor::from_data_with_backend(&v, &shape, backend.clone())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub fn solve_native_c64<T, B: Backend + Clone>(
+    network: &BenchmarkNetwork,
+    cache: &[Vec<Tensor<T, B>>],
+    backend: &B,
+) -> Complex64
+where
+    T: Scalar + Zero + One + PartialEq + Into<Complex64> + BackendScalar<B>,
+{
+    let out = assignments(network)
+        .iter()
+        .map(|assignment| {
+            let leaves = select_native_leaves(network, cache, assignment);
+            native_walk(&network.contraction_order, &leaves)
+        })
+        .collect::<Vec<_>>();
+    backend.synchronize();
+    let (mut re, mut im) = (Kahan::default(), Kahan::default());
+    for x in out {
+        assert_eq!(x.numel(), 1);
+        let c: Complex64 = x.to_vec()[0].into();
+        re.add(c.re);
+        im.add(c.im)
+    }
+    Complex64::new(re.sum, im.sum)
 }
 
 fn local_assignments(network: &BenchmarkNetwork, labels: &[usize]) -> Vec<HashMap<usize, usize>> {

@@ -22,6 +22,12 @@ struct Args {
     slice_iters: usize,
     anneal_steps: usize,
     study_out: Option<String>,
+    // W4: artifact scalar dtype. "f32" downcasts the yao-TN's f64 gate data
+    // (benchmark default); "c64" keeps f64 for the reference runs.
+    dtype: String,
+    // W4: reuse an existing artifact's archived tree/cuts byte-identically
+    // instead of re-optimizing (same-plan rule for the c64 reference set).
+    import_tree: Option<String>,
 }
 fn args() -> Args {
     let mut a = std::env::args().skip(1);
@@ -50,6 +56,8 @@ fn args() -> Args {
         // Paper's anneal length (greensa.jl); polish pass uses half.
         anneal_steps: 600_000,
         study_out: None,
+        dtype: "f32".into(),
+        import_tree: None,
     };
     while let Some(f) = a.next() {
         let v = a.next().unwrap_or_else(|| panic!("{f} requires a value"));
@@ -70,6 +78,8 @@ fn args() -> Args {
             "--optimizer" => x.optimizer = v,
             "--anneal-steps" => x.anneal_steps = v.parse().unwrap(),
             "--study-out" => x.study_out = Some(v),
+            "--dtype" => x.dtype = v,
+            "--import-tree" => x.import_tree = Some(v),
             _ => panic!("unknown option {f}"),
         }
     }
@@ -224,6 +234,11 @@ fn main() {
         .iter()
         .map(|(k, v)| (label(k), *v))
         .collect::<HashMap<_, _>>();
+    assert!(
+        matches!(a.dtype.as_str(), "f32" | "c64"),
+        "--dtype must be f32 or c64"
+    );
+    let c64 = a.dtype == "c64";
     assert_eq!(ixs.len(), source.tensors.len());
     let mut tensors = Vec::new();
     for (i, t) in source.tensors.iter().enumerate() {
@@ -233,17 +248,45 @@ fn main() {
         assert_eq!(t.data_im.len(), n);
         tensors.push(BenchmarkTensor {
             shape: t.shape.clone(),
-            data_re: column_major(
-                &t.data_re.iter().map(|x| *x as f32).collect::<Vec<_>>(),
-                &t.shape,
-            ),
-            data_im: column_major(
-                &t.data_im.iter().map(|x| *x as f32).collect::<Vec<_>>(),
-                &t.shape,
-            ),
+            data_re: if c64 {
+                Vec::new()
+            } else {
+                column_major(
+                    &t.data_re.iter().map(|x| *x as f32).collect::<Vec<_>>(),
+                    &t.shape,
+                )
+            },
+            data_im: if c64 {
+                Vec::new()
+            } else {
+                column_major(
+                    &t.data_im.iter().map(|x| *x as f32).collect::<Vec<_>>(),
+                    &t.shape,
+                )
+            },
+            data_re_f64: c64.then(|| column_major(&t.data_re, &t.shape)),
+            data_im_f64: c64.then(|| column_major(&t.data_im, &t.shape)),
             structurally_complex: t.data_im.iter().any(|x| *x != 0.0),
         });
     }
+    // W4: --import-tree loads the reference artifact and reuses its archived
+    // tree/cuts; optimization and slicing below are skipped.
+    let imported: Option<BenchmarkNetwork> = a.import_tree.as_ref().map(|path| {
+        let r: BenchmarkNetwork =
+            serde_json::from_reader(BufReader::new(File::open(path).unwrap()))
+                .expect("invalid reference artifact");
+        assert_eq!(r.format, "omeinsum-yao-benchmark-v2");
+        assert_eq!(
+            r.eincode.input_indices, ixs,
+            "--import-tree artifact's input labels do not match the input network"
+        );
+        assert_eq!(
+            r.eincode.output_indices, iy,
+            "--import-tree artifact's output labels do not match the input network"
+        );
+        eprintln!("--import-tree {path}: reusing archived tree/cuts; optimizer and slicer flags ignored");
+        r
+    });
     let code = EinCode::new(ixs.clone(), iy.clone());
     let optimizer = match a.opt_profile.as_str() {
         "default" => TreeSA::default(),
@@ -254,7 +297,10 @@ fn main() {
     .with_niters(a.opt_iters)
     .with_sc_target(a.optimizer_sc);
     let is_complex: Vec<bool> = tensors.iter().map(|t| t.structurally_complex).collect();
-    let (original, study) = match a.optimizer.as_str() {
+    let (original, study) = if let Some(r) = &imported {
+        (r.contraction_order.to_nested(), None)
+    } else {
+        match a.optimizer.as_str() {
         "treesa" => (
             optimize_code(&code, &sizes, &optimizer).expect("TreeSA produced no tree"),
             None,
@@ -271,20 +317,28 @@ fn main() {
             (outcome.full_anneal.clone(), Some(outcome))
         }
         other => panic!("unknown optimizer {other}"),
+        }
     };
     if a.study_out.is_some() && study.is_none() {
-        panic!("--study-out requires --optimizer green-sa");
+        panic!("--study-out requires --optimizer green-sa (not available with --import-tree)");
     }
     let unsliced = contraction_complexity(&original, &sizes, &ixs);
     if let (Some(path), Some(outcome)) = (&a.study_out, &study) {
         write_green_study(path, &a, &code, &sizes, &is_complex, outcome, &unsliced);
     }
-    let slicer = TreeSASlicer::fast()
-        .with_ntrials(a.slice_trials)
-        .with_niters(a.slice_iters)
-        .with_sc_target(a.slicer_sc);
-    let sliced = slice_code(&original, &sizes, &slicer, &ixs).expect("TreeSASlicer failed");
-    let mut cuts = sliced.slicing;
+    let (sliced_nested, mut cuts) = if let Some(r) = &imported {
+        (original.clone(), r.cuts.clone())
+    } else {
+        let slicer = TreeSASlicer::fast()
+            .with_ntrials(a.slice_trials)
+            .with_niters(a.slice_iters)
+            .with_sc_target(a.slicer_sc);
+        let sliced = slice_code(&original, &sizes, &slicer, &ixs).expect("TreeSASlicer failed");
+        let mut cuts = sliced.slicing;
+        cuts.sort_unstable();
+        cuts.dedup();
+        (sliced.eins, cuts)
+    };
     cuts.sort_unstable();
     cuts.dedup();
     for c in &cuts {
@@ -300,15 +354,21 @@ fn main() {
         "assignment cap exceeded: {assignments} > {}",
         a.max
     );
-    let tree = TreeNode::from_nested(&sliced.eins);
+    let tree = TreeNode::from_nested(&sliced_nested);
     let leaves = tree.validate(tensors.len()).expect("invalid tree");
     assert_eq!(
         leaves.len(),
         tensors.len(),
         "tree does not contain every tensor"
     );
+    if let Some(r) = &imported {
+        assert_eq!(
+            assignments, r.assignment_count,
+            "imported cuts do not reproduce the reference assignment count"
+        );
+    }
     let adjusted = cut_sizes(&sizes, &cuts);
-    let per = contraction_complexity(&sliced.eins, &adjusted, &ixs);
+    let per = contraction_complexity(&sliced_nested, &adjusted, &ixs);
     let total = Complexity {
         log2_flops: per.tc + (assignments as f64).log2(),
         log2_peak_elements: per.sc,
@@ -327,17 +387,18 @@ fn main() {
         .iter()
         .map(|t| t.shape.iter().product::<usize>())
         .sum();
-    audit.native_resident_input_cache_bytes = audit.native_resident_input_cache_elements * 8;
+    audit.native_resident_input_cache_bytes =
+        audit.native_resident_input_cache_elements * if c64 { 16 } else { 8 };
     audit.tree_real_resident_input_cache_elements = tensors
         .iter()
         .map(|t| t.shape.iter().product::<usize>() * (1 + usize::from(t.structurally_complex)))
         .sum();
-    audit.tree_real_resident_input_cache_bytes = audit.tree_real_resident_input_cache_elements * 4;
-    let artifact = BenchmarkNetwork {
-        format: "omeinsum-yao-benchmark-v2".into(),
-        source_format: source.format,
-        source_mode: source.mode,
-        optimizer: OptimizerConfig {
+    audit.tree_real_resident_input_cache_bytes =
+        audit.tree_real_resident_input_cache_elements * if c64 { 8 } else { 4 };
+    let optimizer_cfg = imported
+        .as_ref()
+        .map(|r| r.optimizer.clone())
+        .unwrap_or(OptimizerConfig {
             algorithm: match a.optimizer.as_str() {
                 "green-sa" => "omeco::GreenSA(TreeSA-init)".into(),
                 _ => "omeco::TreeSA".into(),
@@ -361,15 +422,25 @@ fn main() {
             },
             merge_factor: if a.optimizer == "green-sa" { 3.0 } else { 0.0 },
             ride_factor: if a.optimizer == "green-sa" { 2.0 } else { 0.0 },
-        },
-        slicer: SlicerConfig {
+        });
+    let slicer_cfg = imported
+        .as_ref()
+        .map(|r| r.slicer.clone())
+        .unwrap_or(SlicerConfig {
             algorithm: "omeco::TreeSASlicer".into(),
             ntrials: a.slice_trials,
             niters: a.slice_iters,
             sc_target: a.slicer_sc,
             optimization_ratio: 1.0,
             seed_base: 42,
-        },
+        });
+    let artifact = BenchmarkNetwork {
+        format: "omeinsum-yao-benchmark-v2".into(),
+        source_format: source.format,
+        source_mode: source.mode,
+        dtype: a.dtype.clone(),
+        optimizer: optimizer_cfg,
+        slicer: slicer_cfg,
         eincode: BenchmarkEinCode {
             input_indices: ixs,
             output_indices: iy,
