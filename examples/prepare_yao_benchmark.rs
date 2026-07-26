@@ -272,9 +272,11 @@ fn main() {
     // W4: --import-tree loads the reference artifact and reuses its archived
     // tree/cuts; optimization and slicing below are skipped.
     let imported: Option<BenchmarkNetwork> = a.import_tree.as_ref().map(|path| {
+        let mut d =
+            serde_json::Deserializer::from_reader(BufReader::new(File::open(path).unwrap()));
+        d.disable_recursion_limit();
         let r: BenchmarkNetwork =
-            serde_json::from_reader(BufReader::new(File::open(path).unwrap()))
-                .expect("invalid reference artifact");
+            serde::Deserialize::deserialize(&mut d).expect("invalid reference artifact");
         assert_eq!(r.format, "omeinsum-yao-benchmark-v2");
         assert_eq!(
             r.eincode.input_indices, ixs,
