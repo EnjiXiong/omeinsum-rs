@@ -1,11 +1,11 @@
 use omeinsum::static_plan::{
     allocate_live_ranges, benchmark_prepared, build_geometry_plan, build_plan_bundle,
-    coalesce_permutation, contract_complex64, decompose_permutation, green_operand_plane_batches,
-    lower_plan_traces, plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, ArenaSlot,
-    BenchmarkConfig, BenchmarkTarget, BinaryContractionTree, ComplexNetwork, ComplexTensor,
-    ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind, LeafClass, LiveRange,
-    PlanBundle, PlanStats, Plane, PreparedExecutable, Representation, ScratchRole, StaticPlan,
-    TensorSpec, ValueId, ValueSpec,
+    build_plan_bundle_with_preprocessing, coalesce_permutation, contract_complex64,
+    decompose_permutation, green_operand_plane_batches, lower_plan_traces, plan_f32_arena,
+    prepare_cpu_f32, prepare_cpu_f64, ArenaSlot, BenchmarkConfig, BenchmarkTarget,
+    BinaryContractionTree, ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet,
+    InputTensor, KernelKind, LeafClass, LeafPreprocessing, LiveRange, PlanBundle, PlanStats, Plane,
+    PreparedExecutable, Representation, ScratchRole, StaticPlan, TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Mutex};
@@ -106,6 +106,56 @@ fn two_leaf_scalar_network(left_imag: f64, right_imag: f64) -> ComplexNetwork<f6
                 },
                 real: vec![3.0, 4.0],
                 imag: vec![right_imag, 0.0],
+            },
+        ],
+        output_modes: vec![],
+        size_dict: vec![(0, 2)],
+        tree: BinaryContractionTree::Node {
+            output_modes: vec![],
+            left: Box::new(BinaryContractionTree::Leaf { tensor_index: 0 }),
+            right: Box::new(BinaryContractionTree::Leaf { tensor_index: 1 }),
+        },
+    }
+}
+
+fn phase_real_two_leaf_network(
+    left_phase: f64,
+    right_phase: f64,
+    right_is_genuinely_complex: bool,
+) -> ComplexNetwork<f64> {
+    let left_phase = num_complex::Complex64::from_polar(1.0, left_phase);
+    let right_phase = num_complex::Complex64::from_polar(1.0, right_phase);
+    let left_real = [1.0, -1.0];
+    let right_base = if right_is_genuinely_complex {
+        [
+            num_complex::Complex64::new(0.5, 0.75),
+            num_complex::Complex64::new(-0.25, 0.125),
+        ]
+    } else {
+        [
+            num_complex::Complex64::new(3.0, 0.0),
+            num_complex::Complex64::new(4.0, 0.0),
+        ]
+    };
+    let left = left_real.map(|value| left_phase * value);
+    let right = right_base.map(|value| right_phase * value);
+    ComplexNetwork {
+        tensors: vec![
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![0],
+                    shape: vec![2],
+                },
+                real: left.iter().map(|value| value.re).collect(),
+                imag: left.iter().map(|value| value.im).collect(),
+            },
+            ComplexTensor {
+                spec: TensorSpec {
+                    modes: vec![0],
+                    shape: vec![2],
+                },
+                real: right.iter().map(|value| value.re).collect(),
+                imag: right.iter().map(|value| value.im).collect(),
             },
         ],
         output_modes: vec![],
@@ -234,6 +284,8 @@ fn plan_bundle_round_trips_json() {
     let bundle = PlanBundle {
         format: "omeinsum-static-plan-v1".to_string(),
         realness_tol: 1e-12,
+        leaf_preprocessing: LeafPreprocessing::Raw,
+        phase_canonicalization: None,
         tree_hash: "tree".to_string(),
         inputs: InputSet {
             tensors: vec![InputTensor {
@@ -361,6 +413,173 @@ fn leaf_classification_uses_inclusive_f64_tolerance_and_rejects_nonfinite() {
 
     network.tensors[1].real[0] = f64::INFINITY;
     assert!(build_plan_bundle(&network, 1e-12).is_err());
+}
+
+#[test]
+fn phase_canonicalization_makes_sqrty_shaped_leaf_real_and_preserves_scalar() {
+    let network = phase_real_two_leaf_network(std::f64::consts::FRAC_PI_4, 0.0, true);
+    let raw = build_plan_bundle(&network, 1e-12).unwrap();
+    assert_eq!(raw.realified_rank3.stats.complex_leaf_count, 2);
+    let raw_json = serde_json::to_value(&raw).unwrap();
+    assert!(raw_json.get("leaf_preprocessing").is_none());
+    assert!(raw_json.get("phase_canonicalization").is_none());
+
+    let canonical = build_plan_bundle_with_preprocessing(
+        &network,
+        1e-12,
+        LeafPreprocessing::PhaseCanonicalized,
+    )
+    .unwrap();
+    assert_eq!(
+        canonical.leaf_preprocessing,
+        LeafPreprocessing::PhaseCanonicalized
+    );
+    assert_eq!(canonical.realified_rank3.stats.complex_leaf_count, 1);
+    assert_eq!(canonical.inputs.tensors[0].class, LeafClass::Real);
+    assert_eq!(canonical.inputs.tensors[0].real, vec![1.0, -1.0]);
+    assert_eq!(canonical.inputs.tensors[0].imag, vec![0.0, 0.0]);
+    assert_eq!(canonical.inputs.tensors[1].class, LeafClass::Complex);
+    let report = canonical.phase_canonicalization.as_ref().unwrap();
+    assert_eq!(report.source_real_leaf_count, 0);
+    assert_eq!(report.source_complex_leaf_count, 2);
+    assert_eq!(report.canonicalized_leaf_count, 1);
+    assert_eq!(report.phase_anchor, Some(1));
+    assert!((report.accumulated_phase.re - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-15);
+    assert!((report.accumulated_phase.im - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-15);
+
+    let raw_value = contract_complex64(&raw.flat_4m, &raw.inputs).unwrap();
+    let canonical_value = contract_complex64(&canonical.flat_4m, &canonical.inputs).unwrap();
+    assert!((raw_value.re - canonical_value.re).abs() <= 1e-12);
+    assert!((raw_value.im - canonical_value.im).abs() <= 1e-12);
+    let mut rank3 = prepare_cpu_f64(&canonical.realified_rank3, &canonical.inputs).unwrap();
+    rank3.enqueue().unwrap();
+    rank3.synchronize().unwrap();
+    let rank3_value = rank3.output().unwrap();
+    assert!((raw_value.re - rank3_value.re).abs() <= 1e-12);
+    assert!((raw_value.im - rank3_value.im).abs() <= 1e-12);
+
+    let mut invalid = canonical.clone();
+    invalid
+        .phase_canonicalization
+        .as_mut()
+        .unwrap()
+        .phase_anchor = Some(invalid.inputs.tensors.len());
+    assert!(invalid.validate().is_err());
+    let mut invalid_no_op = canonical.clone();
+    let invalid_no_op_report = invalid_no_op.phase_canonicalization.as_mut().unwrap();
+    invalid_no_op_report.canonicalized_leaf_count = 0;
+    invalid_no_op_report.phase_anchor = None;
+    invalid_no_op_report.accumulated_phase = ComplexValue { re: 0.0, im: 1.0 };
+    assert!(invalid_no_op.validate().is_err());
+    let mut invalid = canonical;
+    invalid.phase_canonicalization = None;
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn phase_canonicalization_solves_the_full_tolerance_feasibility_interval() {
+    let tolerance = 1e-12;
+    let mut network = phase_real_two_leaf_network(std::f64::consts::FRAC_PI_4, 0.0, true);
+    let phase = num_complex::Complex64::from_polar(1.0, std::f64::consts::FRAC_PI_4);
+    let noisy_real = [
+        phase * num_complex::Complex64::new(1.0, tolerance),
+        phase * num_complex::Complex64::new(1.0, -tolerance),
+    ];
+    network.tensors[0].real = noisy_real.iter().map(|value| value.re).collect();
+    network.tensors[0].imag = noisy_real.iter().map(|value| value.im).collect();
+
+    let canonical = build_plan_bundle_with_preprocessing(
+        &network,
+        tolerance,
+        LeafPreprocessing::PhaseCanonicalized,
+    )
+    .unwrap();
+
+    assert_eq!(canonical.inputs.tensors[0].class, LeafClass::Real);
+    assert_eq!(canonical.realified_rank3.stats.complex_leaf_count, 1);
+    assert_eq!(
+        canonical
+            .phase_canonicalization
+            .as_ref()
+            .unwrap()
+            .canonicalized_leaf_count,
+        1
+    );
+}
+
+#[test]
+fn phase_canonicalization_retains_one_anchor_for_all_phase_real_network() {
+    let network = phase_real_two_leaf_network(
+        std::f64::consts::FRAC_PI_4,
+        std::f64::consts::FRAC_PI_6,
+        false,
+    );
+    let raw = build_plan_bundle(&network, 1e-12).unwrap();
+    let canonical = build_plan_bundle_with_preprocessing(
+        &network,
+        1e-12,
+        LeafPreprocessing::PhaseCanonicalized,
+    )
+    .unwrap();
+
+    assert_eq!(raw.realified_rank3.stats.complex_leaf_count, 2);
+    assert_eq!(canonical.realified_rank3.stats.complex_leaf_count, 1);
+    assert_eq!(
+        canonical
+            .inputs
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.class == LeafClass::Real)
+            .count(),
+        1
+    );
+    let report = canonical.phase_canonicalization.as_ref().unwrap();
+    assert_eq!(report.canonicalized_leaf_count, 2);
+    assert_eq!(report.phase_anchor, Some(0));
+
+    let raw_value = contract_complex64(&raw.flat_4m, &raw.inputs).unwrap();
+    let canonical_value = contract_complex64(&canonical.flat_4m, &canonical.inputs).unwrap();
+    assert!((raw_value.re - canonical_value.re).abs() <= 1e-12);
+    assert!((raw_value.im - canonical_value.im).abs() <= 1e-12);
+}
+
+#[test]
+fn phase_canonicalization_allows_zero_complex_leaves_when_phases_cancel() {
+    let network = phase_real_two_leaf_network(
+        std::f64::consts::FRAC_PI_4,
+        -std::f64::consts::FRAC_PI_4,
+        false,
+    );
+    let raw = build_plan_bundle(&network, 1e-12).unwrap();
+    let canonical = build_plan_bundle_with_preprocessing(
+        &network,
+        1e-12,
+        LeafPreprocessing::PhaseCanonicalized,
+    )
+    .unwrap();
+
+    assert_eq!(raw.realified_rank3.stats.complex_leaf_count, 2);
+    assert_eq!(canonical.realified_rank3.stats.complex_leaf_count, 0);
+    assert_eq!(
+        canonical
+            .inputs
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.class == LeafClass::Real)
+            .count(),
+        2
+    );
+    let report = canonical.phase_canonicalization.as_ref().unwrap();
+    assert_eq!(report.canonicalized_leaf_count, 2);
+    assert_eq!(report.phase_anchor, Some(0));
+    assert!((report.accumulated_phase.re.abs() - 1.0).abs() <= 1e-15);
+    assert!(report.accumulated_phase.im.abs() <= 1e-15);
+
+    let raw_value = contract_complex64(&raw.flat_4m, &raw.inputs).unwrap();
+    let canonical_value =
+        contract_complex64(&canonical.realified_rank3, &canonical.inputs).unwrap();
+    assert!((raw_value.re - canonical_value.re).abs() <= 1e-12);
+    assert!((raw_value.im - canonical_value.im).abs() <= 1e-12);
 }
 
 #[test]

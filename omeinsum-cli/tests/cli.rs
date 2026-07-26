@@ -50,6 +50,16 @@ fn two_leaf_yao_tn() -> serde_json::Value {
     })
 }
 
+fn phase_real_yao_tn() -> serde_json::Value {
+    let phase = std::f64::consts::FRAC_1_SQRT_2;
+    let mut value = two_leaf_yao_tn();
+    value["tensors"][0]["data_re"] = serde_json::json!([phase, -phase]);
+    value["tensors"][0]["data_im"] = serde_json::json!([phase, -phase]);
+    value["tensors"][1]["data_re"] = serde_json::json!([0.5, -0.25]);
+    value["tensors"][1]["data_im"] = serde_json::json!([0.75, 0.125]);
+    value
+}
+
 fn deep_scalar_chain_yao_tn(internal_nodes: usize) -> serde_json::Value {
     let mut tree = serde_json::json!({"isleaf": true, "tensorindex": 0});
     for tensor_index in 1..=internal_nodes {
@@ -191,6 +201,70 @@ fn static_plan_normalizes_optimized_yao_tn_without_changing_tree_order() {
     assert_eq!(root["left"], 0);
     assert_eq!(root["right"], 1);
     assert_eq!(root["output"], 2);
+}
+
+#[test]
+fn static_plan_phase_canonicalized_mode_is_explicit_and_auditable() {
+    let input = write_temp_json(&phase_real_yao_tn().to_string());
+    let raw = cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        raw.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    let raw: serde_json::Value = serde_json::from_slice(&raw.stdout).unwrap();
+    assert!(raw.get("leaf_preprocessing").is_none());
+    assert!(raw.get("phase_canonicalization").is_none());
+    assert_eq!(raw["realified_rank3"]["stats"]["complex_leaf_count"], 2);
+
+    let canonical = cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--leaf-preprocessing",
+            "phase-canonicalized",
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        canonical.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&canonical.stderr)
+    );
+    let canonical: serde_json::Value = serde_json::from_slice(&canonical.stdout).unwrap();
+    assert_eq!(canonical["leaf_preprocessing"], "phase-canonicalized");
+    assert_eq!(
+        canonical["phase_canonicalization"]["canonicalized_leaf_count"],
+        1
+    );
+    assert_eq!(canonical["phase_canonicalization"]["phase_anchor"], 1);
+    assert_eq!(
+        canonical["realified_rank3"]["stats"]["complex_leaf_count"],
+        1
+    );
+    assert_eq!(canonical["inputs"]["tensors"][0]["class"], "real");
+    assert_eq!(canonical["inputs"]["tensors"][1]["class"], "complex");
+
+    cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--leaf-preprocessing",
+            "unknown",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid value"));
 }
 
 #[test]

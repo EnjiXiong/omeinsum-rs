@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use crate::backend::contract_plan::plan_contraction;
 
 use super::hash::{plan_hash, tree_hash};
+use super::leaf_preprocessing::classify_inputs;
 use super::{
-    BinaryContractionTree, ComplexNetwork, ContractionSpec, InputSet, InputTensor, KernelKind,
-    LeafClass, PlanBundle, PlanError, PlanNode, PlanStats, Plane, RealificationCost,
+    BinaryContractionTree, ComplexNetwork, ContractionSpec, InputSet, KernelKind, LeafClass,
+    LeafPreprocessing, PlanBundle, PlanError, PlanNode, PlanStats, Plane, RealificationCost,
     Representation, ScratchId, ScratchRole, ScratchSpec, StaticPlan, TensorSpec, ValueId,
     ValueSpec,
 };
@@ -86,7 +87,16 @@ pub fn build_plan_bundle(
     network: &ComplexNetwork<f64>,
     realness_tol: f64,
 ) -> Result<PlanBundle, PlanError> {
-    let inputs = classify_inputs(network, realness_tol)?;
+    build_plan_bundle_with_preprocessing(network, realness_tol, LeafPreprocessing::Raw)
+}
+
+pub fn build_plan_bundle_with_preprocessing(
+    network: &ComplexNetwork<f64>,
+    realness_tol: f64,
+    leaf_preprocessing: LeafPreprocessing,
+) -> Result<PlanBundle, PlanError> {
+    let (inputs, phase_canonicalization) =
+        classify_inputs(network, realness_tol, leaf_preprocessing)?;
     let geometry = build_geometry_plan(network)?;
     let real_leaf_count = inputs
         .tensors
@@ -103,6 +113,8 @@ pub fn build_plan_bundle(
     let bundle = PlanBundle {
         format: "omeinsum-static-plan-v1".to_string(),
         realness_tol,
+        leaf_preprocessing,
+        phase_canonicalization,
         tree_hash: real_skeleton.tree_hash.clone(),
         inputs,
         real_skeleton,
@@ -111,85 +123,6 @@ pub fn build_plan_bundle(
     };
     bundle.validate()?;
     Ok(bundle)
-}
-
-fn classify_inputs(
-    network: &ComplexNetwork<f64>,
-    realness_tol: f64,
-) -> Result<InputSet<f64>, PlanError> {
-    if !realness_tol.is_finite() || realness_tol <= 0.0 {
-        return Err(PlanError::InvalidNetwork(format!(
-            "realness tolerance must be positive and finite, got {realness_tol}"
-        )));
-    }
-    let tensors = network
-        .tensors
-        .iter()
-        .enumerate()
-        .map(|(index, tensor)| {
-            let elements = tensor
-                .spec
-                .shape
-                .iter()
-                .try_fold(1usize, |product, size| product.checked_mul(*size));
-            let elements = elements.ok_or_else(|| PlanError::InvalidTensor {
-                index,
-                detail: "shape product overflows usize".to_string(),
-            })?;
-            if tensor.real.len() != elements || tensor.imag.len() != elements {
-                return Err(PlanError::InvalidTensor {
-                    index,
-                    detail: format!(
-                        "shape has {elements} elements but real/imag lengths are {}/{}",
-                        tensor.real.len(),
-                        tensor.imag.len()
-                    ),
-                });
-            }
-            if let Some((plane, position, value)) = tensor
-                .real
-                .iter()
-                .enumerate()
-                .map(|(position, value)| ("real", position, *value))
-                .chain(
-                    tensor
-                        .imag
-                        .iter()
-                        .enumerate()
-                        .map(|(position, value)| ("imag", position, *value)),
-                )
-                .find(|(_, _, value)| !value.is_finite())
-            {
-                return Err(PlanError::InvalidTensor {
-                    index,
-                    detail: format!("{plane}[{position}] is non-finite: {value}"),
-                });
-            }
-            let imag_max = tensor
-                .imag
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0_f64, f64::max);
-            let class = if imag_max <= realness_tol {
-                LeafClass::Real
-            } else {
-                LeafClass::Complex
-            };
-            let imag = if class == LeafClass::Real {
-                vec![0.0; elements]
-            } else {
-                tensor.imag.clone()
-            };
-            Ok(InputTensor {
-                spec: tensor.spec.clone(),
-                real: tensor.real.clone(),
-                imag,
-                class,
-                imag_max,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(InputSet { tensors })
 }
 
 fn configure_real_skeleton(
@@ -1113,6 +1046,75 @@ impl PlanBundle {
                             detail: "complex leaf imag_max is inconsistent".to_string(),
                         });
                     }
+                }
+            }
+        }
+        match (
+            self.leaf_preprocessing,
+            self.phase_canonicalization.as_ref(),
+        ) {
+            (LeafPreprocessing::Raw, None) => {}
+            (LeafPreprocessing::Raw, Some(_)) => {
+                return Err(PlanError::InvalidNetwork(
+                    "raw leaf preprocessing has phase-canonicalization metadata".to_string(),
+                ));
+            }
+            (LeafPreprocessing::PhaseCanonicalized, None) => {
+                return Err(PlanError::InvalidNetwork(
+                    "phase-canonicalized inputs have no preprocessing metadata".to_string(),
+                ));
+            }
+            (LeafPreprocessing::PhaseCanonicalized, Some(report)) => {
+                let source_count = report
+                    .source_real_leaf_count
+                    .checked_add(report.source_complex_leaf_count)
+                    .ok_or_else(|| {
+                        PlanError::InvalidNetwork("source leaf counts overflow usize".to_string())
+                    })?;
+                if source_count != self.inputs.tensors.len() {
+                    return Err(PlanError::InvalidNetwork(
+                        "phase-canonicalization source counts differ from inputs".to_string(),
+                    ));
+                }
+                if report.canonicalized_leaf_count > report.source_complex_leaf_count {
+                    return Err(PlanError::InvalidNetwork(
+                        "canonicalized leaf count exceeds source complex leaves".to_string(),
+                    ));
+                }
+                match (report.canonicalized_leaf_count, report.phase_anchor) {
+                    (0, None) => {}
+                    (0, Some(_)) => {
+                        return Err(PlanError::InvalidNetwork(
+                            "phase report has an anchor without canonicalized leaves".to_string(),
+                        ));
+                    }
+                    (_, Some(anchor)) if anchor < self.inputs.tensors.len() => {}
+                    (_, Some(_)) => {
+                        return Err(PlanError::InvalidNetwork(
+                            "phase anchor is outside the input tensor array".to_string(),
+                        ));
+                    }
+                    (_, None) => {
+                        return Err(PlanError::InvalidNetwork(
+                            "canonicalized leaves have no phase anchor".to_string(),
+                        ));
+                    }
+                }
+                let phase = report.accumulated_phase;
+                if report.canonicalized_leaf_count == 0 && (phase.re != 1.0 || phase.im != 0.0) {
+                    return Err(PlanError::InvalidNetwork(
+                        "phase report without canonicalized leaves must have unit phase one"
+                            .to_string(),
+                    ));
+                }
+                let phase_norm = phase.re.hypot(phase.im);
+                if !phase.re.is_finite()
+                    || !phase.im.is_finite()
+                    || (phase_norm - 1.0).abs() > 1e-12
+                {
+                    return Err(PlanError::InvalidNetwork(
+                        "accumulated leaf phase is not finite and unit magnitude".to_string(),
+                    ));
                 }
             }
         }

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod autodiff;
 mod benchmark_plan;
@@ -16,6 +16,23 @@ mod yao_tn;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LeafPreprocessingArg {
+    Raw,
+    PhaseCanonicalized,
+}
+
+impl LeafPreprocessingArg {
+    fn into_core(self) -> omeinsum::static_plan::LeafPreprocessing {
+        match self {
+            Self::Raw => omeinsum::static_plan::LeafPreprocessing::Raw,
+            Self::PhaseCanonicalized => {
+                omeinsum::static_plan::LeafPreprocessing::PhaseCanonicalized
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -133,6 +150,10 @@ enum Commands {
         /// Maximum imaginary magnitude for classifying a tensor as real
         #[arg(long, default_value_t = 1e-12)]
         realness_tol: f64,
+
+        /// Optional leaf preprocessing; phase canonicalization is a separate gauge experiment
+        #[arg(long, value_enum, default_value = "raw")]
+        leaf_preprocessing: LeafPreprocessingArg,
 
         /// Output file (default: stdout)
         #[arg(short, long)]
@@ -297,9 +318,16 @@ fn main() {
         Commands::StaticPlan {
             input,
             realness_tol,
+            leaf_preprocessing,
             output,
             pretty,
-        } => static_plan::run(&input, realness_tol, output.as_deref(), pretty),
+        } => static_plan::run(
+            &input,
+            realness_tol,
+            leaf_preprocessing.into_core(),
+            output.as_deref(),
+            pretty,
+        ),
         Commands::ExecutePlan {
             plan,
             backend,

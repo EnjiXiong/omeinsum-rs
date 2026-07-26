@@ -39,6 +39,20 @@ pub enum LeafClass {
     Complex,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeafPreprocessing {
+    #[default]
+    Raw,
+    PhaseCanonicalized,
+}
+
+impl LeafPreprocessing {
+    pub fn is_raw(&self) -> bool {
+        *self == Self::Raw
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ValueId(pub usize);
@@ -166,9 +180,22 @@ pub struct StaticPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseCanonicalizationReport {
+    pub source_real_leaf_count: usize,
+    pub source_complex_leaf_count: usize,
+    pub canonicalized_leaf_count: usize,
+    pub phase_anchor: Option<usize>,
+    pub accumulated_phase: ComplexValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanBundle {
     pub format: String,
     pub realness_tol: f64,
+    #[serde(default, skip_serializing_if = "LeafPreprocessing::is_raw")]
+    pub leaf_preprocessing: LeafPreprocessing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_canonicalization: Option<PhaseCanonicalizationReport>,
     pub tree_hash: String,
     pub inputs: InputSet<f64>,
     pub real_skeleton: StaticPlan,
