@@ -2,12 +2,16 @@
 #[path = "support/yao_benchmark.rs"]
 mod format;
 use format::*;
-use omeco::{contraction_complexity, optimize_code, slice_code, EinCode, TreeSA, TreeSASlicer};
+use omeco::{
+    contraction_complexity, green_pipeline, optimize_code, slice_code, EinCode, GreenAnnealer,
+    TreeSA, TreeSASlicer,
+};
 use std::{collections::HashMap, fs::File, io::BufReader};
 
 struct Args {
     input: String,
     output: String,
+    optimizer: String,
     optimizer_sc: f64,
     slicer_sc: f64,
     max: usize,
@@ -16,6 +20,8 @@ struct Args {
     opt_iters: usize,
     slice_trials: usize,
     slice_iters: usize,
+    anneal_steps: usize,
+    study_out: Option<String>,
 }
 fn args() -> Args {
     let mut a = std::env::args().skip(1);
@@ -26,6 +32,9 @@ fn args() -> Args {
     let mut x = Args {
         input,
         output,
+        // treesa: one-stage TreeSA (v3 policy). green-sa: TreeSA init + the
+        // paper's second-stage green-aware anneal (W2, omeco::GreenAnnealer).
+        optimizer: "treesa".into(),
         // The optimizer's sc target shapes the tree search; it must not exclude
         // good high-sc trees (the paper's Table-1 trees reach sc = 35). Memory
         // is enforced by the slicer below, not by the optimizer.
@@ -38,6 +47,9 @@ fn args() -> Args {
         opt_iters: 20,
         slice_trials: 1,
         slice_iters: 5,
+        // Paper's anneal length (greensa.jl); polish pass uses half.
+        anneal_steps: 600_000,
+        study_out: None,
     };
     while let Some(f) = a.next() {
         let v = a.next().unwrap_or_else(|| panic!("{f} requires a value"));
@@ -55,6 +67,9 @@ fn args() -> Args {
             "--optimizer-iters" => x.opt_iters = v.parse().unwrap(),
             "--slicer-trials" => x.slice_trials = v.parse().unwrap(),
             "--slicer-iters" => x.slice_iters = v.parse().unwrap(),
+            "--optimizer" => x.optimizer = v,
+            "--anneal-steps" => x.anneal_steps = v.parse().unwrap(),
+            "--study-out" => x.study_out = Some(v),
             _ => panic!("unknown option {f}"),
         }
     }
@@ -84,6 +99,107 @@ fn metric(x: omeco::ContractionComplexity) -> Complexity {
         log2_peak_elements: x.sc,
         log2_readwrites: x.rwc,
     }
+}
+
+/// Dump the fig-pipe three-pass dataset for one circuit (W2). All costs come
+/// from a single TreeSA start, so the four passes are directly comparable.
+fn write_green_study(
+    path: &str,
+    a: &Args,
+    code: &EinCode<usize>,
+    sizes: &HashMap<usize, usize>,
+    is_complex: &[bool],
+    outcome: &omeco::GreenPipeOutcome<usize>,
+    annealed: &omeco::ContractionComplexity,
+) {
+    let start_complexity = contraction_complexity(&outcome.start, sizes, &code.ixs);
+    // Cross-check the annealer's (m, r) bookkeeping against audit_tree on the
+    // exported unsliced tree (W2 spec test iii, campaign side).
+    let audit = audit_tree(
+        &TreeNode::from_nested(&outcome.full_anneal),
+        is_complex,
+        sizes,
+        annealed.sc,
+    );
+    let base = outcome.full_anneal_pass_volume
+        + outcome.full_anneal_ride_volume
+        + outcome.full_anneal_merge_volume;
+    let annealer_m = outcome.full_anneal_merge_volume / base;
+    let annealer_r = outcome.full_anneal_ride_volume / base;
+    let fraction_diff = (audit.m - annealer_m)
+        .abs()
+        .max((audit.r - annealer_r).abs());
+    assert!(
+        fraction_diff < 1e-9,
+        "annealer/audit fraction mismatch: {fraction_diff}"
+    );
+    let log2 = |x: f64| x.log2();
+    let best = outcome.best_real_cost;
+    let study = serde_json::json!({
+        "format": "green-sa-study-v1",
+        "circuit": std::path::Path::new(&a.input)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(""),
+        "tensors": code.num_tensors(),
+        "labels": code.unique_labels().len(),
+        "structurally_complex": is_complex.iter().filter(|&&c| c).count(),
+        "factors": {"merge": 3.0, "ride": 2.0},
+        "schedule": {"nsteps": a.anneal_steps, "t0": 1.0, "t1": 0.005, "seeds": [42, 7, 2026]},
+        "polish_schedule": {"nsteps": a.anneal_steps / 2, "t0": 0.03, "t1": 0.002, "seeds": [42, 7, 2026]},
+        "initializer": {
+            "algorithm": "omeco::TreeSA",
+            "profile": a.opt_profile,
+            "ntrials": a.opt_trials,
+            "niters": a.opt_iters,
+            "sc_target": a.optimizer_sc,
+            "seed_base": 42
+        },
+        "costs": {
+            "green_blind": outcome.green_blind_cost,
+            "best_real": best,
+            "convert_only": outcome.convert_only_cost,
+            "polished": outcome.polished_cost,
+            "full_anneal": outcome.full_anneal_cost,
+            "start_volume": outcome.start_volume
+        },
+        "costs_log2": {
+            "green_blind": log2(outcome.green_blind_cost),
+            "best_real": log2(best),
+            "convert_only": log2(outcome.convert_only_cost),
+            "polished": log2(outcome.polished_cost),
+            "full_anneal": log2(outcome.full_anneal_cost),
+            "start_volume": log2(outcome.start_volume)
+        },
+        "ratios_vs_best_real": {
+            "green_blind": outcome.green_blind_cost / best,
+            "convert_only": outcome.convert_only_cost / best,
+            "polished": outcome.polished_cost / best,
+            "full_anneal": outcome.full_anneal_cost / best
+        },
+        "full_anneal_fractions": {
+            "pass": outcome.full_anneal_pass_volume / base,
+            "ride": outcome.full_anneal_ride_volume / base,
+            "merge": outcome.full_anneal_merge_volume / base
+        },
+        "audit_crosscheck": {
+            "m": audit.m,
+            "r": audit.r,
+            "predicted_overhead": audit.predicted_overhead,
+            "annealer_m": annealer_m,
+            "annealer_r": annealer_r,
+            "fraction_abs_diff": fraction_diff
+        },
+        "start_tree": {"tc": start_complexity.tc, "sc": start_complexity.sc},
+        "annealed_tree": {"tc": annealed.tc, "sc": annealed.sc},
+        "seconds": {
+            "treesa_init": outcome.seconds.0,
+            "blind_anneal": outcome.seconds.1,
+            "aware_anneal": outcome.seconds.2,
+            "polish": outcome.seconds.3
+        }
+    });
+    serde_json::to_writer_pretty(File::create(path).unwrap(), &study).unwrap();
 }
 
 fn main() {
@@ -137,8 +253,32 @@ fn main() {
     .with_ntrials(a.opt_trials)
     .with_niters(a.opt_iters)
     .with_sc_target(a.optimizer_sc);
-    let original = optimize_code(&code, &sizes, &optimizer).expect("TreeSA produced no tree");
+    let is_complex: Vec<bool> = tensors.iter().map(|t| t.structurally_complex).collect();
+    let (original, study) = match a.optimizer.as_str() {
+        "treesa" => (
+            optimize_code(&code, &sizes, &optimizer).expect("TreeSA produced no tree"),
+            None,
+        ),
+        // W2: TreeSA init -> the paper's second-stage green-aware anneal
+        // (full 3-seed x 600k-step pipeline). Also produces the fig-pipe
+        // three-pass dataset from the same TreeSA start.
+        "green-sa" => {
+            let annealer = GreenAnnealer::default()
+                .with_nsteps(a.anneal_steps)
+                .with_initializer(optimizer.clone());
+            let outcome = green_pipeline(&code, &sizes, &is_complex, &annealer)
+                .expect("green pipeline produced no tree");
+            (outcome.full_anneal.clone(), Some(outcome))
+        }
+        other => panic!("unknown optimizer {other}"),
+    };
+    if a.study_out.is_some() && study.is_none() {
+        panic!("--study-out requires --optimizer green-sa");
+    }
     let unsliced = contraction_complexity(&original, &sizes, &ixs);
+    if let (Some(path), Some(outcome)) = (&a.study_out, &study) {
+        write_green_study(path, &a, &code, &sizes, &is_complex, outcome, &unsliced);
+    }
     let slicer = TreeSASlicer::fast()
         .with_ntrials(a.slice_trials)
         .with_niters(a.slice_iters)
@@ -198,12 +338,29 @@ fn main() {
         source_format: source.format,
         source_mode: source.mode,
         optimizer: OptimizerConfig {
-            algorithm: "omeco::TreeSA".into(),
-            version: "0.2.6".into(),
+            algorithm: match a.optimizer.as_str() {
+                "green-sa" => "omeco::GreenSA(TreeSA-init)".into(),
+                _ => "omeco::TreeSA".into(),
+            },
+            version: "0.3.0".into(),
             ntrials: a.opt_trials,
             niters: a.opt_iters,
             sc_target: a.optimizer_sc,
             seed_base: 42,
+            anneal_steps: if a.optimizer == "green-sa" {
+                a.anneal_steps
+            } else {
+                0
+            },
+            anneal_t0: if a.optimizer == "green-sa" { 1.0 } else { 0.0 },
+            anneal_t1: if a.optimizer == "green-sa" { 0.005 } else { 0.0 },
+            anneal_seeds: if a.optimizer == "green-sa" {
+                vec![42, 7, 2026]
+            } else {
+                vec![]
+            },
+            merge_factor: if a.optimizer == "green-sa" { 3.0 } else { 0.0 },
+            ride_factor: if a.optimizer == "green-sa" { 2.0 } else { 0.0 },
         },
         slicer: SlicerConfig {
             algorithm: "omeco::TreeSASlicer".into(),
