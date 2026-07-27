@@ -241,11 +241,21 @@ fn run(network: &BenchmarkNetwork, optimizer: &TreeSA) -> serde_json::Value {
     })
 }
 
+/// Deeply nested contraction_order trees exceed serde_json's default
+/// recursion limit of 128 (sycamore hits it); disable the limit as in
+/// prepare_yao_benchmark's --import-tree path.
+fn deserialize_json<'de, R: serde_json::de::Read<'de>, T: serde::Deserialize<'de>>(
+    mut d: serde_json::Deserializer<R>,
+) -> T {
+    d.disable_recursion_limit();
+    serde::Deserialize::deserialize(&mut d).expect("invalid benchmark artifact")
+}
+
 fn main() {
     let a = args();
-    let network: BenchmarkNetwork =
-        serde_json::from_reader(BufReader::new(File::open(&a.input).unwrap()))
-            .expect("invalid benchmark artifact");
+    let network: BenchmarkNetwork = deserialize_json(serde_json::Deserializer::from_reader(
+        BufReader::new(File::open(&a.input).unwrap()),
+    ));
     let optimizer = match a.profile.as_str() {
         "default" => TreeSA::default(),
         "fast" => TreeSA::fast(),
@@ -367,6 +377,23 @@ mod tests {
         ] {
             assert!((path.as_f64().unwrap() - c["tc"].as_f64().unwrap()).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn deeply_nested_tree_json_parses() {
+        // serde_json's default recursion limit is 128 nested levels; archived
+        // trees for the large circuits nest far deeper.
+        let mut node = TreeNode::Leaf { tensor_index: 0 };
+        for i in 1..1500 {
+            node = TreeNode::Node {
+                args: vec![node, TreeNode::Leaf { tensor_index: i }],
+                input_indices: vec![vec![], vec![]],
+                output_indices: vec![],
+            };
+        }
+        let network_json = serde_json::to_vec(&node).unwrap();
+        let back: TreeNode = deserialize_json(serde_json::Deserializer::from_slice(&network_json));
+        assert!(matches!(back, TreeNode::Node { .. }));
     }
 
     #[test]
