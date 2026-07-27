@@ -188,6 +188,9 @@ fn route_permutation(
     strides: &[usize],
     permutation: &[usize],
 ) -> Result<PermuteRoute, AscendError> {
+    if std::env::var_os("OMEINSUM_PERMUTE_FORCE_HOST").is_some() {
+        return Ok(PermuteRoute::Host);
+    }
     if let Some(plan) = dense_permutation(storage_len, shape, strides, permutation)? {
         return Ok(PermuteRoute::Single(plan));
     }
