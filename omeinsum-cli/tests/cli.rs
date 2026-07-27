@@ -525,6 +525,8 @@ fn execute_sliced_plan_emits_the_complete_reference_and_three_outputs() {
 
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["format"], "omeinsum-sliced-execution-check-v1");
+    assert_eq!(report["reference_policy"], "compute");
+    assert_eq!(report["correctness_admission"], "reference-computed");
     assert_eq!(report["source_tree_hash"], report["reduced_tree_hash"]);
     assert_eq!(report["slicing"]["modes"], serde_json::json!([7, 9]));
     assert_eq!(report["slicing"]["dimensions"], serde_json::json!([2, 2]));
@@ -551,6 +553,25 @@ fn execute_sliced_plan_emits_the_complete_reference_and_three_outputs() {
             serde_json::json!({"re": 33.75, "im": 0.0})
         );
     }
+}
+
+#[test]
+fn execute_sliced_plan_rejects_omitted_reference_on_cpu() {
+    let plan = build_sliced_plan_file();
+    cmd()
+        .args([
+            "execute-sliced-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "cpu",
+            "--reference-policy",
+            "omitted-user-authorized-npu-first",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "only valid with --backend ascend",
+        ));
 }
 
 #[cfg(not(feature = "ascend"))]
@@ -609,6 +630,8 @@ fn benchmark_sliced_plan_reports_complete_times_and_explicit_residency() {
 
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["format"], "omeinsum-sliced-benchmark-report-v1");
+    assert_eq!(report["reference_policy"], "compute");
+    assert_eq!(report["correctness_admission"], "reference-computed");
     assert_eq!(report["protocol"], "complete-sliced-contraction");
     assert_eq!(report["residency"], "sequential-single-representation");
     assert_eq!(report["timed_region"], "complete-sliced-contraction");

@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::execute_plan::{prepare_cpu, select_plans, CpuDtype};
 use crate::execute_sliced_plan::{read_sliced_bundle, sliced_reference_complex64};
+use crate::sliced_reference_policy::SlicedReferencePolicy;
 
 #[cfg(feature = "ascend")]
 use crate::execute_plan::parse_ascend_precision;
@@ -36,7 +37,10 @@ struct SlicedBenchmarkReport {
     reduced_plan_hashes: Vec<(Representation, String)>,
     slicing: SliceSpec,
     aggregate_volumes: Vec<SlicedVolume>,
-    reference_complex64: omeinsum::static_plan::ComplexValue,
+    reference_policy: &'static str,
+    correctness_admission: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_complex64: Option<omeinsum::static_plan::ComplexValue>,
     timings: Vec<ModeTiming>,
     #[cfg(feature = "ascend")]
     device: Option<AscendDeviceInfo>,
@@ -97,6 +101,7 @@ pub(crate) fn run(
     dtype: &str,
     device_id: Option<i32>,
     precision_mode: &str,
+    reference_policy: &str,
     capture_realified: &str,
     warmups: usize,
     samples: usize,
@@ -107,7 +112,9 @@ pub(crate) fn run(
 ) -> Result<(), String> {
     let bundle = read_sliced_bundle(plan_path)?;
     let selected = select_plans(&bundle.reduced, representations)?;
-    let reference_complex64 = sliced_reference_complex64(&bundle)?;
+    let reference_policy = SlicedReferencePolicy::parse(reference_policy)?;
+    let reference_complex64 =
+        reference_policy.evaluate(backend, || sliced_reference_complex64(&bundle))?;
     let config = BenchmarkConfig {
         warmups,
         samples,
@@ -181,6 +188,8 @@ pub(crate) fn run(
         reduced_plan_hashes,
         slicing: bundle.slice,
         aggregate_volumes: bundle.aggregate_volumes,
+        reference_policy: reference_policy.label(),
+        correctness_admission: reference_policy.correctness_admission(),
         reference_complex64,
         timings: outcome.timings,
         #[cfg(feature = "ascend")]

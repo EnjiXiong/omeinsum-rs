@@ -5,6 +5,7 @@ use omeinsum::static_plan::{
 use serde::Serialize;
 
 use crate::execute_plan::{prepare_cpu, select_plans, CpuDtype};
+use crate::sliced_reference_policy::SlicedReferencePolicy;
 
 #[cfg(feature = "ascend")]
 use crate::execute_plan::parse_ascend_precision;
@@ -23,7 +24,10 @@ struct SlicedExecutionCheck {
     reduced_plan_hashes: Vec<(Representation, String)>,
     slicing: SliceSpec,
     aggregate_volumes: Vec<SlicedVolume>,
-    reference_complex64: ComplexValue,
+    reference_policy: &'static str,
+    correctness_admission: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_complex64: Option<ComplexValue>,
     executions: Vec<SlicedExecutionResult>,
     #[cfg(feature = "ascend")]
     device: Option<AscendDeviceInfo>,
@@ -68,12 +72,15 @@ pub(crate) fn run(
     dtype: &str,
     device_id: Option<i32>,
     precision_mode: &str,
+    reference_policy: &str,
     output: Option<&str>,
     pretty: Option<bool>,
 ) -> Result<(), String> {
     let bundle = read_sliced_bundle(plan_path)?;
     let selected = select_plans(&bundle.reduced, representations)?;
-    let reference_complex64 = sliced_reference_complex64(&bundle)?;
+    let reference_policy = SlicedReferencePolicy::parse(reference_policy)?;
+    let reference_complex64 =
+        reference_policy.evaluate(backend, || sliced_reference_complex64(&bundle))?;
     let outcome = match backend {
         "cpu" => {
             if device_id.is_some() {
@@ -121,6 +128,8 @@ pub(crate) fn run(
         reduced_plan_hashes,
         slicing: bundle.slice,
         aggregate_volumes: bundle.aggregate_volumes,
+        reference_policy: reference_policy.label(),
+        correctness_admission: reference_policy.correctness_admission(),
         reference_complex64,
         executions: outcome.executions,
         #[cfg(feature = "ascend")]

@@ -11,6 +11,7 @@ mod format;
 mod optimize;
 mod parse;
 mod slice_plan;
+mod sliced_reference_policy;
 mod static_plan;
 mod yao_tn;
 
@@ -241,6 +242,10 @@ enum Commands {
         #[arg(long, default_value = "keep-dtype")]
         precision_mode: String,
 
+        /// Complex64 reference policy
+        #[arg(long, default_value = "compute")]
+        reference_policy: String,
+
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
@@ -326,6 +331,10 @@ enum Commands {
         /// Ascend precision mode
         #[arg(long, default_value = "keep-dtype")]
         precision_mode: String,
+
+        /// Complex64 reference policy
+        #[arg(long, default_value = "compute")]
+        reference_policy: String,
 
         /// Capture policy for realified-rank3: off, auto, or required
         #[arg(long, default_value = "off")]
@@ -466,6 +475,7 @@ fn main() {
             dtype,
             device_id,
             precision_mode,
+            reference_policy,
             output,
             pretty,
         } => execute_sliced_plan::run(
@@ -475,6 +485,7 @@ fn main() {
             &dtype,
             device_id,
             &precision_mode,
+            &reference_policy,
             output.as_deref(),
             pretty,
         ),
@@ -514,6 +525,7 @@ fn main() {
             dtype,
             device_id,
             precision_mode,
+            reference_policy,
             capture_realified,
             warmups,
             samples,
@@ -528,6 +540,7 @@ fn main() {
             &dtype,
             device_id,
             &precision_mode,
+            &reference_policy,
             &capture_realified,
             warmups,
             samples,
