@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
-use super::{ComplexValue, Representation};
+use super::{ComplexValue, InputUpdate, LeafClass, Representation, StaticPlan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionError {
@@ -53,9 +53,100 @@ impl std::error::Error for ExecutionError {}
 
 pub trait PreparedExecutable {
     fn representation(&self) -> Representation;
+    fn update_inputs(&mut self, updates: &[InputUpdate<f64>]) -> Result<(), ExecutionError>;
     fn enqueue(&mut self) -> Result<(), ExecutionError>;
     fn synchronize(&mut self) -> Result<(), ExecutionError>;
     fn output(&mut self) -> Result<ComplexValue, ExecutionError>;
+}
+
+impl<T: PreparedExecutable + ?Sized> PreparedExecutable for Box<T> {
+    fn representation(&self) -> Representation {
+        (**self).representation()
+    }
+
+    fn update_inputs(&mut self, updates: &[InputUpdate<f64>]) -> Result<(), ExecutionError> {
+        (**self).update_inputs(updates)
+    }
+
+    fn enqueue(&mut self) -> Result<(), ExecutionError> {
+        (**self).enqueue()
+    }
+
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
+        (**self).synchronize()
+    }
+
+    fn output(&mut self) -> Result<ComplexValue, ExecutionError> {
+        (**self).output()
+    }
+}
+
+pub(crate) fn validate_input_updates(
+    plan: &StaticPlan,
+    leaf_classes: &[LeafClass],
+    updates: &[InputUpdate<f64>],
+) -> Result<(), ExecutionError> {
+    if leaf_classes.len() != plan.leaf_values.len() {
+        return Err(ExecutionError::InvalidPlan(
+            "prepared leaf-class metadata is incomplete".to_string(),
+        ));
+    }
+    let mut seen = vec![false; plan.leaf_values.len()];
+    for update in updates {
+        if update.index >= plan.leaf_values.len() {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "input update index {} is outside {} leaves",
+                update.index,
+                plan.leaf_values.len()
+            )));
+        }
+        if std::mem::replace(&mut seen[update.index], true) {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "input update index {} appears more than once",
+                update.index
+            )));
+        }
+        let value = &plan.values[plan.leaf_values[update.index].0];
+        if update.tensor.spec != value.tensor {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "input update {} geometry differs from its prepared leaf",
+                update.index
+            )));
+        }
+        let elements = update
+            .tensor
+            .spec
+            .shape
+            .iter()
+            .try_fold(1usize, |product, dimension| product.checked_mul(*dimension))
+            .ok_or_else(|| {
+                ExecutionError::InvalidPlan(format!(
+                    "input update {} element count overflows usize",
+                    update.index
+                ))
+            })?;
+        if update.tensor.real.len() != elements || update.tensor.imag.len() != elements {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "input update {} plane length differs from its geometry",
+                update.index
+            )));
+        }
+        if update.tensor.class != leaf_classes[update.index] {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "input update {} changes the frozen leaf class",
+                update.index
+            )));
+        }
+        if update.tensor.class == LeafClass::Real
+            && update.tensor.imag.iter().any(|value| *value != 0.0)
+        {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "input update {} real leaf has a nonzero imaginary plane",
+                update.index
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

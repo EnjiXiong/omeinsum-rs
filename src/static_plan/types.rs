@@ -115,6 +115,12 @@ pub struct InputSet<T> {
     pub tensors: Vec<InputTensor<T>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputUpdate<T> {
+    pub index: usize,
+    pub tensor: InputTensor<T>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComplexTensor<T> {
     pub spec: TensorSpec,

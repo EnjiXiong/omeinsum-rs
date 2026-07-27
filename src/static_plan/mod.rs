@@ -18,5 +18,5 @@ pub use benchmark::*;
 pub use builder::{build_geometry_plan, build_plan_bundle, build_plan_bundle_with_preprocessing};
 pub use cpu::{contract_complex64, prepare_cpu_f32, prepare_cpu_f64};
 pub use error::PlanError;
-pub use slicing::{build_sliced_plan_bundle, gray_assignments, slice_inputs};
+pub use slicing::{build_sliced_plan_bundle, gray_assignments, slice_inputs, SlicedExecutable};
 pub use types::*;

@@ -10,8 +10,9 @@ use crate::algebra::{Algebra, Complex64, Scalar, Standard};
 use crate::{BackendScalar, Cpu, Einsum, Tensor};
 
 use super::{
-    ComplexValue, ExecutionError, InputSet, KernelKind, PlanNode, Plane, PreparedExecutable,
-    Representation, ScratchRole, StaticPlan, TensorSpec,
+    validate_input_updates, ComplexValue, ExecutionError, InputSet, InputUpdate, KernelKind,
+    LeafClass, PlanNode, Plane, PreparedExecutable, Representation, ScratchRole, StaticPlan,
+    TensorSpec,
 };
 
 pub fn prepare_cpu_f64(
@@ -190,6 +191,7 @@ struct ComputedNode<T> {
 struct CpuExecutable<T: CpuReal> {
     representation: Representation,
     plan: StaticPlan,
+    leaf_classes: Vec<LeafClass>,
     values: Vec<PlaneValue<T>>,
     scratch: Vec<Vec<T>>,
     ready: bool,
@@ -254,6 +256,11 @@ where
         Ok(Self {
             representation: plan.representation.clone(),
             plan: plan.clone(),
+            leaf_classes: inputs
+                .tensors
+                .iter()
+                .map(|tensor| tensor.class.clone())
+                .collect(),
             values,
             scratch,
             ready: false,
@@ -383,6 +390,37 @@ where
 {
     fn representation(&self) -> Representation {
         self.representation.clone()
+    }
+
+    fn update_inputs(&mut self, updates: &[InputUpdate<f64>]) -> Result<(), ExecutionError> {
+        validate_input_updates(&self.plan, &self.leaf_classes, updates)?;
+        let converted = updates
+            .iter()
+            .map(|update| {
+                let value_id = self.plan.leaf_values[update.index].0;
+                let real = convert_plane::<T>(&update.tensor.real, update.index, "real")?;
+                let imag = self.values[value_id]
+                    .imag
+                    .as_ref()
+                    .map(|_| convert_plane::<T>(&update.tensor.imag, update.index, "imag"))
+                    .transpose()?;
+                Ok((value_id, real, imag))
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        for (value_id, real, imag) in converted {
+            self.values[value_id].real.copy_from_slice(&real);
+            match (&mut self.values[value_id].imag, imag) {
+                (Some(target), Some(source)) => target.copy_from_slice(&source),
+                (None, None) => {}
+                _ => {
+                    return Err(ExecutionError::InvalidPlan(format!(
+                        "leaf {value_id} plane allocation changed after preparation"
+                    )));
+                }
+            }
+        }
+        self.ready = false;
+        Ok(())
     }
 
     fn enqueue(&mut self) -> Result<(), ExecutionError> {

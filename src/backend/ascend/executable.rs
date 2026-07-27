@@ -1,8 +1,9 @@
 #![allow(clippy::result_large_err)] // Frozen backend diagnostics retain full context.
 
 use crate::static_plan::{
-    decompose_permutation, lower_plan_traces, plan_f32_arena, CoalescedPermutation, ComplexValue,
-    ExecutionError, InputSet, KernelKind, PreparedExecutable, ScratchRole, StaticPlan, TensorSpec,
+    decompose_permutation, lower_plan_traces, plan_f32_arena, validate_input_updates,
+    CoalescedPermutation, ComplexValue, ExecutionError, InputSet, InputUpdate, KernelKind,
+    LeafClass, PreparedExecutable, ScratchRole, StaticPlan, TensorSpec,
 };
 
 use super::capture::{configure_capture, Capture, CaptureAttempt, CaptureRuntime};
@@ -55,7 +56,16 @@ struct OperandSource {
     planes: usize,
 }
 
+struct PreparedInputUpload {
+    value_id: usize,
+    real: Vec<f32>,
+    imag: Option<Vec<f32>>,
+}
+
 pub(crate) struct ExecutableState<'session> {
+    plan: StaticPlan,
+    leaf_classes: Vec<LeafClass>,
+    value_layouts: Vec<ValueLayout>,
     steps: Vec<PreparedStep<'session>>,
     workspace: DeviceBuffer<'session>,
     _scratch: DeviceBuffer<'session>,
@@ -153,6 +163,9 @@ impl<'session> ExecutableState<'session> {
                 )
             })?;
         let output = &value_layouts[plan.output.0];
+        let output_offset = output.offset;
+        let output_planes = output.planes;
+        let output_elements = output.elements;
         let stats = AscendMemoryStats {
             semantic_bytes: arena.semantic_peak_bytes,
             device_arena_bytes: arena.arena_bytes,
@@ -162,13 +175,20 @@ impl<'session> ExecutableState<'session> {
         };
         Ok((
             Self {
+                plan: plan.clone(),
+                leaf_classes: inputs
+                    .tensors
+                    .iter()
+                    .map(|tensor| tensor.class.clone())
+                    .collect(),
+                value_layouts,
                 steps,
                 workspace,
                 _scratch: scratch,
                 semantic_arena,
-                output_offset: output.offset,
-                output_planes: output.planes,
-                output_elements: output.elements,
+                output_offset,
+                output_planes,
+                output_elements,
                 context: &session.context,
                 phase_timings: AscendPhaseTimings {
                     context_create_seconds: 0.0,
@@ -190,6 +210,31 @@ impl<'session> ExecutableState<'session> {
             return capture.run();
         }
         self.enqueue_repeatable()
+    }
+
+    pub(crate) fn update_inputs(
+        &mut self,
+        updates: &[InputUpdate<f64>],
+    ) -> Result<(), ExecutionError> {
+        validate_input_updates(&self.plan, &self.leaf_classes, updates)?;
+        let uploads = updates
+            .iter()
+            .map(|update| {
+                prepare_input_upload(
+                    &self.plan,
+                    update.index,
+                    &update.tensor,
+                    &self.value_layouts,
+                )
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let h2d_start = Instant::now();
+        for upload in &uploads {
+            upload_prepared_input(&self.semantic_arena, &self.value_layouts, upload)?;
+        }
+        self.context.synchronize()?;
+        self.phase_timings.h2d_seconds += h2d_start.elapsed().as_secs_f64();
+        Ok(())
     }
 
     fn enqueue_repeatable(&mut self) -> Result<(), ExecutionError> {
@@ -484,17 +529,69 @@ fn upload_inputs(
     inputs: &InputSet<f64>,
     layouts: &[ValueLayout],
 ) -> Result<(), ExecutionError> {
-    for (index, input) in inputs.tensors.iter().enumerate() {
-        let layout = &layouts[index];
-        let real = to_f32(&input.real, index, "real")?;
-        arena.copy_h2d(layout.offset, &real)?;
-        if layout.planes == 2 {
-            let imag = to_f32(&input.imag, index, "imag")?;
-            arena.copy_h2d(plane_offset(layout, 1)?, &imag)?;
-        }
-        if plan.values[index].planes.len() != layout.planes {
+    let uploads = inputs
+        .tensors
+        .iter()
+        .enumerate()
+        .map(|(index, input)| prepare_input_upload(plan, index, input, layouts))
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
+    for upload in &uploads {
+        upload_prepared_input(arena, layouts, upload)?;
+    }
+    Ok(())
+}
+
+fn prepare_input_upload(
+    plan: &StaticPlan,
+    index: usize,
+    input: &crate::static_plan::InputTensor<f64>,
+    layouts: &[ValueLayout],
+) -> Result<PreparedInputUpload, ExecutionError> {
+    let value_id = plan
+        .leaf_values
+        .get(index)
+        .ok_or_else(|| {
+            ExecutionError::InvalidPlan(format!(
+                "input upload index {index} is outside {} leaves",
+                plan.leaf_values.len()
+            ))
+        })?
+        .0;
+    let layout = layouts.get(value_id).ok_or_else(|| {
+        ExecutionError::InvalidPlan(format!(
+            "leaf {index} value {value_id} has no device layout"
+        ))
+    })?;
+    if plan.values[value_id].planes.len() != layout.planes {
+        return Err(ExecutionError::InvalidPlan(format!(
+            "leaf {index} plane layout changed during upload"
+        )));
+    }
+    let real = to_f32(&input.real, index, "real")?;
+    let imag = (layout.planes == 2)
+        .then(|| to_f32(&input.imag, index, "imag"))
+        .transpose()?;
+    Ok(PreparedInputUpload {
+        value_id,
+        real,
+        imag,
+    })
+}
+
+fn upload_prepared_input(
+    arena: &DeviceBuffer<'_>,
+    layouts: &[ValueLayout],
+    upload: &PreparedInputUpload,
+) -> Result<(), ExecutionError> {
+    let layout = &layouts[upload.value_id];
+    arena.copy_h2d(layout.offset, &upload.real)?;
+    match (layout.planes, upload.imag.as_ref()) {
+        (2, Some(imag)) => arena.copy_h2d(plane_offset(layout, 1)?, imag)?,
+        (1, None) => {}
+        _ => {
             return Err(ExecutionError::InvalidPlan(format!(
-                "leaf {index} plane layout changed during upload"
+                "leaf value {} upload planes differ from its device layout",
+                upload.value_id
             )));
         }
     }
@@ -1020,6 +1117,10 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, ExecutionError> {
 impl PreparedExecutable for super::AscendExecutable<'_> {
     fn representation(&self) -> crate::static_plan::Representation {
         self.representation.clone()
+    }
+
+    fn update_inputs(&mut self, updates: &[InputUpdate<f64>]) -> Result<(), ExecutionError> {
+        self.state.update_inputs(updates)
     }
 
     fn enqueue(&mut self) -> Result<(), ExecutionError> {

@@ -114,6 +114,11 @@ name = "ascend_matmul_smoke"
 path = "examples/ascend_matmul_smoke.rs"
 required-features = ["ascend"]
 
+[[example]]
+name = "ascend_sliced_smoke"
+path = "examples/ascend_sliced_smoke.rs"
+required-features = ["ascend"]
+
 [workspace]
 members = [".", "omeinsum-cli"]
 

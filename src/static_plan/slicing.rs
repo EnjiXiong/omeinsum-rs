@@ -1,9 +1,11 @@
+#![allow(clippy::result_large_err)] // Frozen execution diagnostics intentionally retain context.
+
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    BinaryContractionTree, ComplexNetwork, ComplexTensor, InputSet, InputTensor, LeafClass,
-    PlanBundle, PlanError, Representation, SliceAssignmentOrder, SliceSpec, SlicedPlanBundle,
-    SlicedVolume, StaticPlan, TensorSpec,
+    BinaryContractionTree, ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet,
+    InputTensor, InputUpdate, LeafClass, PlanBundle, PlanError, PreparedExecutable, Representation,
+    SliceAssignmentOrder, SliceSpec, SlicedPlanBundle, SlicedVolume, StaticPlan, TensorSpec,
 };
 
 use super::builder::{configure_flat_4m, configure_real_skeleton, configure_selective};
@@ -167,6 +169,163 @@ pub fn gray_assignments(spec: &SliceSpec) -> Result<Vec<Vec<usize>>, PlanError> 
                 .collect();
             Ok(assignments)
         }
+    }
+}
+
+pub struct SlicedExecutable<E> {
+    inner: E,
+    update_batches: Vec<Vec<InputUpdate<f64>>>,
+    output: Option<ComplexValue>,
+}
+
+impl<E: PreparedExecutable> SlicedExecutable<E> {
+    pub fn new(
+        inner: E,
+        source_inputs: &InputSet<f64>,
+        sliced_plan: &SlicedPlanBundle,
+    ) -> Result<Self, ExecutionError> {
+        sliced_plan
+            .validate()
+            .map_err(|error| ExecutionError::InvalidPlan(error.to_string()))?;
+        if source_inputs != &sliced_plan.source_inputs {
+            return Err(ExecutionError::InvalidPlan(
+                "sliced executable source inputs differ from the sliced plan".to_string(),
+            ));
+        }
+        let assignments = gray_assignments(&sliced_plan.slice)
+            .map_err(|error| ExecutionError::InvalidPlan(error.to_string()))?;
+        let leaf_indices_by_mode = sliced_plan
+            .slice
+            .modes
+            .iter()
+            .map(|mode| {
+                let indices = source_inputs
+                    .tensors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, tensor)| tensor.spec.modes.contains(mode).then_some(index))
+                    .collect::<Vec<_>>();
+                if indices.is_empty() {
+                    Err(ExecutionError::InvalidPlan(format!(
+                        "slice mode {mode} is absent from source leaves"
+                    )))
+                } else {
+                    Ok(indices)
+                }
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let declared_dimensions = sliced_plan
+            .slice
+            .modes
+            .iter()
+            .copied()
+            .zip(sliced_plan.slice.dimensions.iter().copied())
+            .collect::<HashMap<_, _>>();
+        let mut previous = assignments.last().cloned().ok_or_else(|| {
+            ExecutionError::InvalidPlan("sliced assignment schedule is empty".to_string())
+        })?;
+        let mut update_batches = Vec::with_capacity(assignments.len());
+        for current in &assignments {
+            let changed_axes = previous
+                .iter()
+                .zip(current)
+                .enumerate()
+                .filter_map(|(axis, (before, after))| (before != after).then_some(axis))
+                .collect::<Vec<_>>();
+            if changed_axes.len() != 1 {
+                return Err(ExecutionError::InvalidPlan(format!(
+                    "cyclic Gray edge changes {} modes; expected exactly one",
+                    changed_axes.len()
+                )));
+            }
+            let changed_axis = changed_axes[0];
+            let selected = sliced_plan
+                .slice
+                .modes
+                .iter()
+                .copied()
+                .zip(current.iter().copied())
+                .collect::<HashMap<_, _>>();
+            let updates = leaf_indices_by_mode[changed_axis]
+                .iter()
+                .map(|index| {
+                    let tensor = slice_tensor(
+                        *index,
+                        &source_inputs.tensors[*index],
+                        &selected,
+                        &declared_dimensions,
+                    )
+                    .map_err(|error| ExecutionError::InvalidPlan(error.to_string()))?;
+                    Ok(InputUpdate {
+                        index: *index,
+                        tensor,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            update_batches.push(updates);
+            previous.clone_from(current);
+        }
+        Ok(Self {
+            inner,
+            update_batches,
+            output: None,
+        })
+    }
+
+    pub fn execution_mode_label(&self) -> &'static str {
+        "sliced-host-f64-accumulated"
+    }
+
+    pub fn inner(&self) -> &E {
+        &self.inner
+    }
+}
+
+impl<E: PreparedExecutable> PreparedExecutable for SlicedExecutable<E> {
+    fn representation(&self) -> Representation {
+        self.inner.representation()
+    }
+
+    fn update_inputs(&mut self, updates: &[InputUpdate<f64>]) -> Result<(), ExecutionError> {
+        if updates.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecutionError::Unsupported(
+                "a sliced executable owns its frozen input-update schedule".to_string(),
+            ))
+        }
+    }
+
+    fn enqueue(&mut self) -> Result<(), ExecutionError> {
+        let mut sum = ComplexValue { re: 0.0, im: 0.0 };
+        for updates in &self.update_batches {
+            self.inner.update_inputs(updates)?;
+            self.inner.enqueue()?;
+            self.inner.synchronize()?;
+            let value = self.inner.output()?;
+            if !value.re.is_finite() || !value.im.is_finite() {
+                return Err(ExecutionError::NonFiniteOutput(value));
+            }
+            sum.re += value.re;
+            sum.im += value.im;
+            if !sum.re.is_finite() || !sum.im.is_finite() {
+                return Err(ExecutionError::NonFiniteOutput(sum));
+            }
+        }
+        self.output = Some(sum);
+        Ok(())
+    }
+
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+
+    fn output(&mut self) -> Result<ComplexValue, ExecutionError> {
+        self.output.ok_or_else(|| {
+            ExecutionError::InvalidPlan(
+                "sliced output requested before a complete contraction".to_string(),
+            )
+        })
     }
 }
 

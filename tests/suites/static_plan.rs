@@ -4,9 +4,10 @@ use omeinsum::static_plan::{
     contract_complex64, decompose_permutation, gray_assignments, green_operand_plane_batches,
     lower_plan_traces, plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, slice_inputs, ArenaSlot,
     BenchmarkConfig, BenchmarkTarget, BinaryContractionTree, ComplexNetwork, ComplexTensor,
-    ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind, LeafClass, LeafPreprocessing,
-    LiveRange, PlanBundle, PlanError, PlanStats, Plane, PreparedExecutable, Representation,
-    ScratchRole, SliceAssignmentOrder, SliceSpec, StaticPlan, TensorSpec, ValueId, ValueSpec,
+    ComplexValue, ExecutionError, InputSet, InputTensor, InputUpdate, KernelKind, LeafClass,
+    LeafPreprocessing, LiveRange, PlanBundle, PlanError, PlanStats, Plane, PreparedExecutable,
+    Representation, ScratchRole, SliceAssignmentOrder, SliceSpec, SlicedExecutable, StaticPlan,
+    TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Mutex};
@@ -260,6 +261,10 @@ impl PreparedExecutable for FakeExecutable {
         Representation::RealSkeleton
     }
 
+    fn update_inputs(&mut self, _updates: &[InputUpdate<f64>]) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+
     fn enqueue(&mut self) -> Result<(), ExecutionError> {
         self.enqueues_since_sync += 1;
         self.order.lock().unwrap().push(self.id);
@@ -277,6 +282,57 @@ impl PreparedExecutable for FakeExecutable {
 
     fn output(&mut self) -> Result<ComplexValue, ExecutionError> {
         Ok(self.value)
+    }
+}
+
+#[derive(Default)]
+struct SlicedFakeState {
+    updates: Vec<Vec<InputUpdate<f64>>>,
+    enqueue_count: usize,
+    sync_count: usize,
+}
+
+struct SlicedFakeExecutable {
+    state: Arc<Mutex<SlicedFakeState>>,
+    outputs: Vec<ComplexValue>,
+}
+
+impl PreparedExecutable for SlicedFakeExecutable {
+    fn representation(&self) -> Representation {
+        Representation::RealifiedRank3
+    }
+
+    fn update_inputs(&mut self, updates: &[InputUpdate<f64>]) -> Result<(), ExecutionError> {
+        self.state.lock().unwrap().updates.push(updates.to_vec());
+        Ok(())
+    }
+
+    fn enqueue(&mut self) -> Result<(), ExecutionError> {
+        let mut state = self.state.lock().unwrap();
+        if state.enqueue_count >= self.outputs.len() {
+            return Err(ExecutionError::InvalidPlan(
+                "sliced fake received too many enqueues".to_string(),
+            ));
+        }
+        state.enqueue_count += 1;
+        Ok(())
+    }
+
+    fn synchronize(&mut self) -> Result<(), ExecutionError> {
+        self.state.lock().unwrap().sync_count += 1;
+        Ok(())
+    }
+
+    fn output(&mut self) -> Result<ComplexValue, ExecutionError> {
+        let enqueue_count = self.state.lock().unwrap().enqueue_count;
+        self.outputs
+            .get(enqueue_count.saturating_sub(1))
+            .copied()
+            .ok_or_else(|| {
+                ExecutionError::InvalidPlan(
+                    "sliced fake output requested before enqueue".to_string(),
+                )
+            })
     }
 }
 
@@ -673,6 +729,189 @@ fn sliced_gray_schedule_rejects_inconsistent_and_overflowing_specs() {
         gray_assignments(&overflow),
         Err(PlanError::InvalidNetwork(detail)) if detail == "slice count overflows usize"
     ));
+}
+
+#[test]
+fn prepared_input_update_changes_a_cpu_leaf_without_repreparing() {
+    let bundle = build_plan_bundle(&two_leaf_scalar_network(0.0, 0.0), 1e-12).unwrap();
+    let mut executable = prepare_cpu_f64(&bundle.realified_rank3, &bundle.inputs).unwrap();
+    executable.enqueue().unwrap();
+    executable.synchronize().unwrap();
+    assert_eq!(
+        executable.output().unwrap(),
+        ComplexValue { re: 11.0, im: 0.0 }
+    );
+
+    let mut tensor = bundle.inputs.tensors[0].clone();
+    tensor.real = vec![5.0, 6.0];
+    executable
+        .update_inputs(&[InputUpdate { index: 0, tensor }])
+        .unwrap();
+    executable.enqueue().unwrap();
+    executable.synchronize().unwrap();
+
+    assert_eq!(
+        executable.output().unwrap(),
+        ComplexValue { re: 39.0, im: 0.0 }
+    );
+}
+
+#[test]
+fn prepared_input_update_rejects_duplicate_index_geometry_class_and_plane_drift() {
+    let bundle = build_plan_bundle(&two_leaf_scalar_network(0.0, 0.0), 1e-12).unwrap();
+    let unchanged = bundle.inputs.tensors[0].clone();
+
+    let mut duplicate = prepare_cpu_f64(&bundle.realified_rank3, &bundle.inputs).unwrap();
+    let duplicate_error = duplicate
+        .update_inputs(&[
+            InputUpdate {
+                index: 0,
+                tensor: unchanged.clone(),
+            },
+            InputUpdate {
+                index: 0,
+                tensor: unchanged.clone(),
+            },
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        duplicate_error,
+        ExecutionError::InvalidPlan(detail)
+            if detail == "input update index 0 appears more than once"
+    ));
+
+    let mut out_of_range = prepare_cpu_f64(&bundle.realified_rank3, &bundle.inputs).unwrap();
+    let range_error = out_of_range
+        .update_inputs(&[InputUpdate {
+            index: 2,
+            tensor: unchanged.clone(),
+        }])
+        .unwrap_err();
+    assert!(matches!(
+        range_error,
+        ExecutionError::InvalidPlan(detail)
+            if detail == "input update index 2 is outside 2 leaves"
+    ));
+
+    let mut wrong_geometry = unchanged.clone();
+    wrong_geometry.spec.shape = vec![1];
+    wrong_geometry.real.truncate(1);
+    wrong_geometry.imag.truncate(1);
+    let mut geometry = prepare_cpu_f64(&bundle.realified_rank3, &bundle.inputs).unwrap();
+    let geometry_error = geometry
+        .update_inputs(&[InputUpdate {
+            index: 0,
+            tensor: wrong_geometry,
+        }])
+        .unwrap_err();
+    assert!(matches!(
+        geometry_error,
+        ExecutionError::InvalidPlan(detail)
+            if detail == "input update 0 geometry differs from its prepared leaf"
+    ));
+
+    let mut wrong_class = unchanged;
+    wrong_class.class = LeafClass::Complex;
+    wrong_class.imag = vec![1.0, 0.0];
+    wrong_class.imag_max = 1.0;
+    wrong_class.classification_imag_max = Some(1.0);
+    let mut class = prepare_cpu_f64(&bundle.realified_rank3, &bundle.inputs).unwrap();
+    let class_error = class
+        .update_inputs(&[InputUpdate {
+            index: 0,
+            tensor: wrong_class,
+        }])
+        .unwrap_err();
+    assert!(matches!(
+        class_error,
+        ExecutionError::InvalidPlan(detail)
+            if detail == "input update 0 changes the frozen leaf class"
+    ));
+
+    let mut wrong_plane = bundle.inputs.tensors[0].clone();
+    wrong_plane.imag = vec![1.0, 0.0];
+    wrong_plane.imag_max = 1.0;
+    let mut plane = prepare_cpu_f64(&bundle.realified_rank3, &bundle.inputs).unwrap();
+    let plane_error = plane
+        .update_inputs(&[InputUpdate {
+            index: 0,
+            tensor: wrong_plane,
+        }])
+        .unwrap_err();
+    assert!(matches!(
+        plane_error,
+        ExecutionError::InvalidPlan(detail)
+            if detail == "input update 0 real leaf has a nonzero imaginary plane"
+    ));
+}
+
+#[test]
+fn sliced_executable_runs_every_gray_edge_and_updates_only_affected_leaves() {
+    let source = build_plan_bundle(&matrix_scalar_network(0.5, 0.25), 1e-12).unwrap();
+    let sliced = build_sliced_plan_bundle(&source, &[0, 2]).unwrap();
+    let state = Arc::new(Mutex::new(SlicedFakeState::default()));
+    let inner = SlicedFakeExecutable {
+        state: Arc::clone(&state),
+        outputs: vec![
+            ComplexValue { re: 1.0, im: 0.5 },
+            ComplexValue { re: 2.0, im: 1.0 },
+            ComplexValue { re: 3.0, im: 1.5 },
+            ComplexValue { re: 4.0, im: 2.0 },
+        ],
+    };
+    let mut executable = SlicedExecutable::new(inner, &sliced.source_inputs, &sliced).unwrap();
+
+    executable.enqueue().unwrap();
+    executable.synchronize().unwrap();
+
+    assert_eq!(
+        executable.output().unwrap(),
+        ComplexValue { re: 10.0, im: 5.0 }
+    );
+    assert_eq!(
+        executable.execution_mode_label(),
+        "sliced-host-f64-accumulated"
+    );
+    let state = state.lock().unwrap();
+    assert_eq!(state.enqueue_count, 4);
+    assert_eq!(state.sync_count, 4);
+    assert_eq!(
+        state
+            .updates
+            .iter()
+            .map(|batch| batch.iter().map(|update| update.index).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![vec![0, 2], vec![1, 2], vec![0, 2], vec![1, 2]]
+    );
+    assert_eq!(state.updates[0][0].tensor.real, vec![1.0, 3.0]);
+    assert_eq!(state.updates[0][1].tensor.real, vec![1.0]);
+    assert_eq!(state.updates[1][0].tensor.real, vec![2.0, 3.0]);
+    assert_eq!(state.updates[1][1].tensor.real, vec![0.25]);
+    assert_eq!(state.updates[2][0].tensor.real, vec![2.0, 4.0]);
+    assert_eq!(state.updates[2][1].tensor.real, vec![2.0]);
+    assert_eq!(state.updates[3][0].tensor.real, vec![0.5, -1.0]);
+    assert_eq!(state.updates[3][1].tensor.real, vec![-0.5]);
+}
+
+#[test]
+fn sliced_executable_cpu_matches_the_phase_canonicalized_complex_reference() {
+    let source = build_plan_bundle_with_preprocessing(
+        &phase_real_two_leaf_network(std::f64::consts::FRAC_PI_4, 0.0, true),
+        1e-12,
+        LeafPreprocessing::PhaseCanonicalized,
+    )
+    .unwrap();
+    let expected = contract_complex64(&source.flat_4m, &source.inputs).unwrap();
+    let sliced = build_sliced_plan_bundle(&source, &[0]).unwrap();
+    let inner = prepare_cpu_f64(&sliced.reduced.realified_rank3, &sliced.reduced.inputs).unwrap();
+    let mut executable = SlicedExecutable::new(inner, &sliced.source_inputs, &sliced).unwrap();
+
+    executable.enqueue().unwrap();
+    executable.synchronize().unwrap();
+    let observed = executable.output().unwrap();
+
+    assert!((observed.re - expected.re).abs() <= 1e-12);
+    assert!((observed.im - expected.im).abs() <= 1e-12);
 }
 
 #[test]

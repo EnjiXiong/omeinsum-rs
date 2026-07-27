@@ -4,7 +4,7 @@ use omeinsum::backend::ascend::{
 };
 use omeinsum::static_plan::{
     build_plan_bundle, prepare_cpu_f32, BinaryContractionTree, ComplexNetwork, ComplexTensor,
-    InputSet, PreparedExecutable, StaticPlan, TensorSpec,
+    InputSet, InputUpdate, PreparedExecutable, StaticPlan, TensorSpec,
 };
 
 fn two_leaf_network(left_imag: f64, right_imag: f64) -> ComplexNetwork<f64> {
@@ -153,6 +153,56 @@ fn ascend_repeatable_preserves_uploaded_inputs_across_enqueues() {
     compare_plan(&session, &bundle.real_skeleton, &bundle.inputs);
     compare_plan(&session, &bundle.flat_4m, &bundle.inputs);
     compare_plan(&session, &bundle.realified_rank3, &bundle.inputs);
+}
+
+#[test]
+#[ignore = "requires a live Ascend device and CANN runtime"]
+fn ascend_changed_leaf_update_matches_cpu_without_repreparing() {
+    let device_id = std::env::var("OME_ASCEND_TEST_DEVICE_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let session = AscendSession::new(&AscendSessionConfig {
+        device_id,
+        precision_mode: AscendPrecisionMode::KeepDtype,
+    })
+    .unwrap();
+    let bundle = build_plan_bundle(&two_leaf_network(0.0, 0.0), 1e-12).unwrap();
+    let mut updated_inputs = bundle.inputs.clone();
+    updated_inputs.tensors[0].real = vec![5.0, 6.0];
+    let mut cpu = prepare_cpu_f32(&bundle.realified_rank3, &updated_inputs).unwrap();
+    cpu.enqueue().unwrap();
+    cpu.synchronize().unwrap();
+    let expected = cpu.output().unwrap();
+
+    let mut npu = AscendExecutable::prepare(
+        &session,
+        &bundle.realified_rank3,
+        &bundle.inputs,
+        &AscendExecutableConfig {
+            execution_mode: AscendExecutionMode::RepeatableAclnn,
+        },
+    )
+    .unwrap();
+    let initial_h2d_seconds = npu.phase_timings().h2d_seconds;
+    npu.update_inputs(&[InputUpdate {
+        index: 0,
+        tensor: updated_inputs.tensors[0].clone(),
+    }])
+    .unwrap();
+    assert!(npu.phase_timings().h2d_seconds >= initial_h2d_seconds);
+    npu.enqueue().unwrap();
+    npu.synchronize().unwrap();
+    let actual = npu.output().unwrap();
+
+    let scale = 1.0f64.max(expected.re.abs()).max(expected.im.abs());
+    let error =
+        ((actual.re - expected.re).powi(2) + (actual.im - expected.im).powi(2)).sqrt() / scale;
+    assert!(
+        error <= 1e-3,
+        "updated Ascend output differs from CPU: expected {expected:?}, actual {actual:?}, \
+         scaled error {error}"
+    );
 }
 
 #[test]
