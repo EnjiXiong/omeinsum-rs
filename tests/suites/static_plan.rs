@@ -1,12 +1,15 @@
+#![allow(clippy::result_large_err)] // Frozen execution diagnostics retain full context.
+
 use omeinsum::static_plan::{
-    allocate_live_ranges, benchmark_prepared, build_geometry_plan, build_plan_bundle,
-    build_plan_bundle_with_preprocessing, build_sliced_plan_bundle, coalesce_permutation,
-    contract_complex64, decompose_permutation, gray_assignments, green_operand_plane_batches,
-    lower_plan_traces, plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, slice_inputs, ArenaSlot,
-    BenchmarkConfig, BenchmarkTarget, BinaryContractionTree, ComplexNetwork, ComplexTensor,
-    ComplexValue, ExecutionError, InputSet, InputTensor, InputUpdate, KernelKind, LeafClass,
-    LeafPreprocessing, LiveRange, PlanBundle, PlanError, PlanStats, Plane, PreparedExecutable,
-    Representation, ScratchRole, SliceAssignmentOrder, SliceSpec, SlicedExecutable, StaticPlan,
+    allocate_live_ranges, benchmark_prepared, benchmark_sequential_resident, build_geometry_plan,
+    build_plan_bundle, build_plan_bundle_with_preprocessing, build_sliced_plan_bundle,
+    coalesce_permutation, contract_complex64, decompose_permutation, gray_assignments,
+    green_operand_plane_batches, lower_plan_traces, plan_f32_arena, prepare_cpu_f32,
+    prepare_cpu_f64, slice_inputs, ArenaSlot, BenchmarkConfig, BenchmarkTarget,
+    BinaryContractionTree, ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet,
+    InputTensor, InputUpdate, KernelKind, LeafClass, LeafPreprocessing, LiveRange, PlanBundle,
+    PlanError, PlanStats, Plane, PreparedExecutable, Representation, ScratchRole,
+    SequentialBenchmarkTarget, SliceAssignmentOrder, SliceSpec, SlicedExecutable, StaticPlan,
     TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
@@ -1751,6 +1754,110 @@ fn benchmark_interleaving_is_seeded_and_nonfinite_outputs_fail() {
     )
     .unwrap_err();
     assert!(matches!(error, ExecutionError::NonFiniteOutput(_)));
+}
+
+fn sequential_benchmark_run(
+    seed: u64,
+) -> (
+    Vec<omeinsum::static_plan::ModeTiming>,
+    Vec<(usize, usize)>,
+    usize,
+) {
+    let targets = [
+        SequentialBenchmarkTarget {
+            representation: Representation::RealSkeleton,
+            backend: "cpu",
+            dtype: "f64",
+            execution_mode: "sliced-host-f64-accumulated",
+        },
+        SequentialBenchmarkTarget {
+            representation: Representation::Flat4M,
+            backend: "cpu",
+            dtype: "f64",
+            execution_mode: "sliced-host-f64-accumulated",
+        },
+        SequentialBenchmarkTarget {
+            representation: Representation::RealifiedRank3,
+            backend: "cpu",
+            dtype: "f64",
+            execution_mode: "sliced-host-f64-accumulated",
+        },
+    ];
+    let seconds_per_contraction = [0.00025, 0.0005, 0.002];
+    let mut calls = Vec::new();
+    let mut live = 0usize;
+    let mut max_live = 0usize;
+    let timings = benchmark_sequential_resident(
+        &targets,
+        &BenchmarkConfig {
+            warmups: 3,
+            samples: 5,
+            min_sample_ms: 1,
+            measurement_order_seed: seed,
+        },
+        |target_index, inner_iterations| {
+            live += 1;
+            max_live = max_live.max(live);
+            calls.push((target_index, inner_iterations));
+            let elapsed = seconds_per_contraction[target_index] * inner_iterations as f64;
+            let output = ComplexValue {
+                re: target_index as f64 + 1.0,
+                im: -(target_index as f64),
+            };
+            live -= 1;
+            Ok((elapsed, output))
+        },
+    )
+    .unwrap();
+    (timings, calls, max_live)
+}
+
+#[test]
+fn sequential_resident_benchmark_is_seeded_single_live_and_statistically_complete() {
+    let (timings, calls, max_live) = sequential_benchmark_run(20260723);
+    let (_, repeated_calls, repeated_max_live) = sequential_benchmark_run(20260723);
+    let (_, other_calls, _) = sequential_benchmark_run(20260724);
+
+    assert_eq!(max_live, 1);
+    assert_eq!(repeated_max_live, 1);
+    assert_eq!(calls, repeated_calls);
+    assert_ne!(
+        &calls[calls.len() - 15..],
+        &other_calls[other_calls.len() - 15..]
+    );
+    assert_eq!(
+        timings
+            .iter()
+            .map(|timing| timing.inner_iterations)
+            .collect::<Vec<_>>(),
+        vec![4, 2, 1]
+    );
+    assert_eq!(timings.len(), 3);
+    for (index, timing) in timings.iter().enumerate() {
+        assert_eq!(timing.raw_seconds_per_contraction.len(), 5);
+        assert_eq!(
+            timing.raw_seconds_per_contraction,
+            vec![[0.00025, 0.0005, 0.002][index]; 5]
+        );
+        assert_eq!(timing.best_seconds, [0.00025, 0.0005, 0.002][index]);
+        assert_eq!(timing.median_seconds, [0.00025, 0.0005, 0.002][index]);
+        assert_eq!(timing.iqr_seconds, 0.0);
+        assert_eq!(
+            timing.output,
+            ComplexValue {
+                re: index as f64 + 1.0,
+                im: -(index as f64),
+            }
+        );
+    }
+    for round in calls[calls.len() - 15..].chunks_exact(3) {
+        let mut order = round
+            .iter()
+            .map(|(target_index, _)| *target_index)
+            .collect::<Vec<_>>();
+        order.sort_unstable();
+        assert_eq!(order, vec![0, 1, 2]);
+    }
 }
 
 #[test]

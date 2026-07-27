@@ -164,6 +164,13 @@ pub struct BenchmarkTarget<'a> {
     pub executable: &'a mut dyn PreparedExecutable,
 }
 
+pub struct SequentialBenchmarkTarget<'a> {
+    pub representation: Representation,
+    pub backend: &'a str,
+    pub dtype: &'a str,
+    pub execution_mode: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkDiagnostics {
     pub warmup_seconds: f64,
@@ -289,6 +296,114 @@ pub fn benchmark_prepared_with_diagnostics(
         )
         .collect::<Result<Vec<_>, _>>()?;
     Ok((timings, BenchmarkDiagnostics { warmup_seconds }))
+}
+
+pub fn benchmark_sequential_resident(
+    targets: &[SequentialBenchmarkTarget<'_>],
+    config: &BenchmarkConfig,
+    mut measure: impl FnMut(usize, usize) -> Result<(f64, ComplexValue), ExecutionError>,
+) -> Result<Vec<ModeTiming>, ExecutionError> {
+    if targets.is_empty() {
+        return Err(ExecutionError::Unsupported(
+            "at least one sequential benchmark target is required".to_string(),
+        ));
+    }
+    if config.warmups == 0 || config.samples == 0 || config.min_sample_ms == 0 {
+        return Err(ExecutionError::Unsupported(
+            "warmups, samples, and min_sample_ms must all be positive".to_string(),
+        ));
+    }
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(config.measurement_order_seed);
+    let mut order = (0..targets.len()).collect::<Vec<_>>();
+    for _ in 0..config.warmups {
+        order.shuffle(&mut rng);
+        for target_index in order.iter().copied() {
+            let (elapsed, output) = measure(target_index, 1)?;
+            validate_sequential_measurement(elapsed, output)?;
+        }
+    }
+
+    let threshold_seconds = Duration::from_millis(config.min_sample_ms).as_secs_f64();
+    let mut inner_iterations = Vec::with_capacity(targets.len());
+    for target_index in 0..targets.len() {
+        let mut iterations = 1usize;
+        loop {
+            let (elapsed, output) = measure(target_index, iterations)?;
+            validate_sequential_measurement(elapsed, output)?;
+            if elapsed >= threshold_seconds {
+                break;
+            }
+            iterations = iterations.checked_mul(2).ok_or_else(|| {
+                ExecutionError::Unsupported(
+                    "sequential calibration iteration count overflowed usize".to_string(),
+                )
+            })?;
+        }
+        inner_iterations.push(iterations);
+    }
+
+    let mut raw = vec![Vec::with_capacity(config.samples); targets.len()];
+    let mut outputs = vec![None; targets.len()];
+    for _ in 0..config.samples {
+        order.shuffle(&mut rng);
+        for target_index in order.iter().copied() {
+            let iterations = inner_iterations[target_index];
+            let (elapsed, output) = measure(target_index, iterations)?;
+            validate_sequential_measurement(elapsed, output)?;
+            raw[target_index].push(elapsed / iterations as f64);
+            outputs[target_index] = Some(output);
+        }
+    }
+
+    targets
+        .iter()
+        .zip(inner_iterations)
+        .zip(raw)
+        .zip(outputs)
+        .map(
+            |(((target, inner_iterations), raw_seconds_per_contraction), output)| {
+                let output = output.ok_or_else(|| {
+                    ExecutionError::Unsupported(
+                        "sequential benchmark target has no measured output".to_string(),
+                    )
+                })?;
+                let (best_seconds, median_seconds, iqr_seconds) =
+                    summarize(&raw_seconds_per_contraction)?;
+                Ok(ModeTiming {
+                    representation: target.representation.clone(),
+                    backend: target.backend.to_string(),
+                    dtype: target.dtype.to_string(),
+                    execution_mode: target.execution_mode.to_string(),
+                    warmups: config.warmups,
+                    samples: config.samples,
+                    min_sample_ms: config.min_sample_ms,
+                    measurement_order_seed: config.measurement_order_seed,
+                    inner_iterations,
+                    raw_seconds_per_contraction,
+                    best_seconds,
+                    median_seconds,
+                    iqr_seconds,
+                    output,
+                })
+            },
+        )
+        .collect()
+}
+
+fn validate_sequential_measurement(
+    elapsed: f64,
+    output: ComplexValue,
+) -> Result<(), ExecutionError> {
+    if !elapsed.is_finite() || elapsed <= 0.0 {
+        return Err(ExecutionError::Unsupported(
+            "sequential measurement elapsed seconds must be positive and finite".to_string(),
+        ));
+    }
+    if !output.re.is_finite() || !output.im.is_finite() {
+        return Err(ExecutionError::NonFiniteOutput(output));
+    }
+    Ok(())
 }
 
 fn summarize(samples: &[f64]) -> Result<(f64, f64, f64), ExecutionError> {

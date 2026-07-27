@@ -2,12 +2,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod autodiff;
 mod benchmark_plan;
+mod benchmark_sliced_plan;
 mod common;
 mod contract;
 mod execute_plan;
+mod execute_sliced_plan;
 mod format;
 mod optimize;
 mod parse;
+mod slice_plan;
 mod static_plan;
 mod yao_tn;
 
@@ -163,6 +166,23 @@ enum Commands {
         #[arg(long)]
         pretty: Option<bool>,
     },
+    /// Derive a fixed physical-mode sliced plan from a frozen static plan
+    SlicePlan {
+        /// Frozen omeinsum-static-plan-v1 JSON file
+        source: String,
+
+        /// Comma-separated physical mode ids
+        #[arg(long)]
+        slice_modes: String,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Pretty-print JSON (default: auto-detect TTY)
+        #[arg(long)]
+        pretty: Option<bool>,
+    },
     /// Execute prepared static plans once and emit untimed correctness outputs
     ExecutePlan {
         /// Frozen omeinsum-static-plan-v1 JSON file
@@ -196,9 +216,95 @@ enum Commands {
         #[arg(long)]
         pretty: Option<bool>,
     },
+    /// Execute a complete physical-slice schedule once for correctness
+    ExecuteSlicedPlan {
+        /// Frozen omeinsum-sliced-plan-v1 JSON file
+        plan: String,
+
+        /// Execution backend
+        #[arg(long, default_value = "cpu")]
+        backend: String,
+
+        /// Comma-separated representations
+        #[arg(long, default_value = "real-skeleton,flat-4m,realified-rank3")]
+        representations: String,
+
+        /// Floating-point dtype
+        #[arg(long, default_value = "f64")]
+        dtype: String,
+
+        /// Ascend device id (required with --backend ascend)
+        #[arg(long)]
+        device_id: Option<i32>,
+
+        /// Ascend precision mode
+        #[arg(long, default_value = "keep-dtype")]
+        precision_mode: String,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Pretty-print JSON (default: auto-detect TTY)
+        #[arg(long)]
+        pretty: Option<bool>,
+    },
     /// Benchmark reusable prepared static plans
     BenchmarkPlan {
         /// Frozen omeinsum-static-plan-v1 JSON file
+        plan: String,
+
+        /// Execution backend
+        #[arg(long, default_value = "cpu")]
+        backend: String,
+
+        /// Comma-separated representations
+        #[arg(long, default_value = "real-skeleton,flat-4m,realified-rank3")]
+        representations: String,
+
+        /// Floating-point dtype
+        #[arg(long, default_value = "f64")]
+        dtype: String,
+
+        /// Ascend device id (required with --backend ascend)
+        #[arg(long)]
+        device_id: Option<i32>,
+
+        /// Ascend precision mode
+        #[arg(long, default_value = "keep-dtype")]
+        precision_mode: String,
+
+        /// Capture policy for realified-rank3: off, auto, or required
+        #[arg(long, default_value = "off")]
+        capture_realified: String,
+
+        /// Untimed warm-up rounds
+        #[arg(long, default_value_t = 3)]
+        warmups: usize,
+
+        /// Timed samples per representation
+        #[arg(long, default_value_t = 5)]
+        samples: usize,
+
+        /// Minimum duration used to calibrate each timed sample
+        #[arg(long, default_value_t = 200)]
+        min_sample_ms: u64,
+
+        /// Seed controlling per-round representation order
+        #[arg(long, default_value_t = 20260723)]
+        measurement_order_seed: u64,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Pretty-print JSON (default: auto-detect TTY)
+        #[arg(long)]
+        pretty: Option<bool>,
+    },
+    /// Benchmark complete physical-slice schedules with sequential residency
+    BenchmarkSlicedPlan {
+        /// Frozen omeinsum-sliced-plan-v1 JSON file
         plan: String,
 
         /// Execution backend
@@ -328,6 +434,12 @@ fn main() {
             output.as_deref(),
             pretty,
         ),
+        Commands::SlicePlan {
+            source,
+            slice_modes,
+            output,
+            pretty,
+        } => slice_plan::run(&source, &slice_modes, output.as_deref(), pretty),
         Commands::ExecutePlan {
             plan,
             backend,
@@ -338,6 +450,25 @@ fn main() {
             output,
             pretty,
         } => execute_plan::run(
+            &plan,
+            &backend,
+            &representations,
+            &dtype,
+            device_id,
+            &precision_mode,
+            output.as_deref(),
+            pretty,
+        ),
+        Commands::ExecuteSlicedPlan {
+            plan,
+            backend,
+            representations,
+            dtype,
+            device_id,
+            precision_mode,
+            output,
+            pretty,
+        } => execute_sliced_plan::run(
             &plan,
             &backend,
             &representations,
@@ -362,6 +493,35 @@ fn main() {
             output,
             pretty,
         } => benchmark_plan::run(
+            &plan,
+            &backend,
+            &representations,
+            &dtype,
+            device_id,
+            &precision_mode,
+            &capture_realified,
+            warmups,
+            samples,
+            min_sample_ms,
+            measurement_order_seed,
+            output.as_deref(),
+            pretty,
+        ),
+        Commands::BenchmarkSlicedPlan {
+            plan,
+            backend,
+            representations,
+            dtype,
+            device_id,
+            precision_mode,
+            capture_realified,
+            warmups,
+            samples,
+            min_sample_ms,
+            measurement_order_seed,
+            output,
+            pretty,
+        } => benchmark_sliced_plan::run(
             &plan,
             &backend,
             &representations,

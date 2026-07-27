@@ -60,6 +60,56 @@ fn phase_real_yao_tn() -> serde_json::Value {
     value
 }
 
+fn matrix_scalar_yao_tn() -> serde_json::Value {
+    serde_json::json!({
+        "format": "yao-tn-v1",
+        "mode": "overlap",
+        "eincode": {
+            "input_indices": [["7", "8"], ["8", "9"], ["7", "9"]],
+            "output_indices": [],
+        },
+        "tensors": [
+            {
+                "shape": [2, 2],
+                "data_re": [1.0, 2.0, 3.0, 4.0],
+                "data_im": [0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "shape": [2, 2],
+                "data_re": [0.5, -1.0, 2.0, 3.0],
+                "data_im": [0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "shape": [2, 2],
+                "data_re": [1.0, -0.5, 0.25, 2.0],
+                "data_im": [0.0, 0.0, 0.0, 0.0],
+            },
+        ],
+        "size_dict": {"7": 2, "8": 2, "9": 2},
+        "contraction_order": {
+            "isleaf": false,
+            "args": [
+                {
+                    "isleaf": false,
+                    "args": [
+                        {"isleaf": true, "tensorindex": 0},
+                        {"isleaf": true, "tensorindex": 1},
+                    ],
+                    "eins": {
+                        "ixs": [[7, 8], [8, 9]],
+                        "iy": [7, 9],
+                    },
+                },
+                {"isleaf": true, "tensorindex": 2},
+            ],
+            "eins": {
+                "ixs": [[7, 9], [7, 9]],
+                "iy": [],
+            },
+        },
+    })
+}
+
 fn deep_scalar_chain_yao_tn(internal_nodes: usize) -> serde_json::Value {
     let mut tree = serde_json::json!({"isleaf": true, "tensorindex": 0});
     for tensor_index in 1..=internal_nodes {
@@ -317,6 +367,54 @@ fn build_static_plan_file() -> NamedTempFile {
     output
 }
 
+fn build_matrix_static_plan_file() -> NamedTempFile {
+    let input = write_temp_json(&matrix_scalar_yao_tn().to_string());
+    let output = NamedTempFile::new().unwrap();
+    let result = cmd()
+        .args([
+            "static-plan",
+            input.path().to_str().unwrap(),
+            "--realness-tol",
+            "1e-12",
+            "--pretty",
+            "false",
+            "-o",
+            output.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    output
+}
+
+fn build_sliced_plan_file() -> NamedTempFile {
+    let source = build_matrix_static_plan_file();
+    let output = NamedTempFile::new().unwrap();
+    let result = cmd()
+        .args([
+            "slice-plan",
+            source.path().to_str().unwrap(),
+            "--slice-modes",
+            "7,9",
+            "--pretty",
+            "false",
+            "-o",
+            output.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    output
+}
+
 #[test]
 fn static_plan_builds_three_valid_hash_distinct_variants() {
     let output = build_static_plan_file();
@@ -363,6 +461,212 @@ fn execute_plan_emits_reference_and_three_untimed_outputs() {
     assert_eq!(report["reference_complex64"]["re"], 11.0);
     assert_eq!(report["executions"].as_array().unwrap().len(), 3);
     assert!(report.get("timings").is_none());
+}
+
+#[test]
+fn slice_plan_derives_a_valid_bundle_without_mutating_the_source() {
+    let source = build_matrix_static_plan_file();
+    let source_before = std::fs::read(source.path()).unwrap();
+    let sliced = NamedTempFile::new().unwrap();
+    let output = cmd()
+        .args([
+            "slice-plan",
+            source.path().to_str().unwrap(),
+            "--slice-modes",
+            "7,9",
+            "--pretty",
+            "false",
+            "-o",
+            sliced.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(std::fs::read(source.path()).unwrap(), source_before);
+    let document = std::fs::read_to_string(sliced.path()).unwrap();
+    let bundle: omeinsum::static_plan::SlicedPlanBundle = serde_json::from_str(&document).unwrap();
+    bundle.validate().unwrap();
+    assert_eq!(bundle.format, "omeinsum-sliced-plan-v1");
+    assert_eq!(bundle.slice.modes, vec![7, 9]);
+    assert_eq!(bundle.slice.dimensions, vec![2, 2]);
+    assert_eq!(bundle.slice.slice_count, 4);
+    assert_eq!(bundle.source_tree_hash, bundle.reduced.tree_hash);
+    assert_eq!(bundle.source_plan_hashes.len(), 3);
+}
+
+#[test]
+fn execute_sliced_plan_emits_the_complete_reference_and_three_outputs() {
+    let plan = build_sliced_plan_file();
+    let output = cmd()
+        .args([
+            "execute-sliced-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "cpu",
+            "--representations",
+            "real-skeleton,flat-4m,realified-rank3",
+            "--dtype",
+            "f64",
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["format"], "omeinsum-sliced-execution-check-v1");
+    assert_eq!(report["source_tree_hash"], report["reduced_tree_hash"]);
+    assert_eq!(report["slicing"]["modes"], serde_json::json!([7, 9]));
+    assert_eq!(report["slicing"]["dimensions"], serde_json::json!([2, 2]));
+    assert_eq!(report["slicing"]["slice_count"], 4);
+    assert_eq!(
+        report["reference_complex64"],
+        serde_json::json!({"re": 33.75, "im": 0.0})
+    );
+    let executions = report["executions"].as_array().unwrap();
+    assert_eq!(executions.len(), 3);
+    assert_eq!(
+        executions
+            .iter()
+            .map(|execution| execution["representation"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["real-skeleton", "flat-4m", "realified-rank3"]
+    );
+    for execution in executions {
+        assert_eq!(execution["backend"], "cpu");
+        assert_eq!(execution["dtype"], "f64");
+        assert_eq!(execution["execution_mode"], "sliced-host-f64-accumulated");
+        assert_eq!(
+            execution["output"],
+            serde_json::json!({"re": 33.75, "im": 0.0})
+        );
+    }
+}
+
+#[cfg(not(feature = "ascend"))]
+#[test]
+fn execute_sliced_plan_reports_when_the_ascend_feature_is_absent() {
+    let plan = build_sliced_plan_file();
+    cmd()
+        .args([
+            "execute-sliced-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "ascend",
+            "--dtype",
+            "f32",
+            "--device-id",
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Ascend backend unavailable; rebuild with --features ascend",
+        ));
+}
+
+#[test]
+fn benchmark_sliced_plan_reports_complete_times_and_explicit_residency() {
+    let plan = build_sliced_plan_file();
+    let output = cmd()
+        .args([
+            "benchmark-sliced-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "cpu",
+            "--representations",
+            "real-skeleton,flat-4m,realified-rank3",
+            "--dtype",
+            "f32",
+            "--warmups",
+            "1",
+            "--samples",
+            "2",
+            "--min-sample-ms",
+            "1",
+            "--measurement-order-seed",
+            "20260723",
+            "--pretty",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["format"], "omeinsum-sliced-benchmark-report-v1");
+    assert_eq!(report["protocol"], "complete-sliced-contraction");
+    assert_eq!(report["residency"], "sequential-single-representation");
+    assert_eq!(report["timed_region"], "complete-sliced-contraction");
+    assert_eq!(report["source_tree_hash"], report["reduced_tree_hash"]);
+    assert_eq!(report["slicing"]["modes"], serde_json::json!([7, 9]));
+    assert_eq!(
+        report["slicing"]["assignment_order"],
+        "binary-reflected-gray"
+    );
+    assert_eq!(report["slicing"]["slice_count"], 4);
+    assert_eq!(
+        report["reference_complex64"],
+        serde_json::json!({"re": 33.75, "im": 0.0})
+    );
+    let timings = report["timings"].as_array().unwrap();
+    assert_eq!(timings.len(), 3);
+    for timing in timings {
+        assert_eq!(timing["backend"], "cpu");
+        assert_eq!(timing["dtype"], "f32");
+        assert_eq!(timing["execution_mode"], "sliced-host-f64-accumulated");
+        assert_eq!(timing["warmups"], 1);
+        assert_eq!(timing["samples"], 2);
+        assert_eq!(timing["min_sample_ms"], 1);
+        assert_eq!(timing["measurement_order_seed"], 20260723);
+        assert_eq!(
+            timing["raw_seconds_per_contraction"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            timing["output"],
+            serde_json::json!({"re": 33.75, "im": 0.0})
+        );
+    }
+}
+
+#[cfg(not(feature = "ascend"))]
+#[test]
+fn benchmark_sliced_plan_reports_when_the_ascend_feature_is_absent() {
+    let plan = build_sliced_plan_file();
+    cmd()
+        .args([
+            "benchmark-sliced-plan",
+            plan.path().to_str().unwrap(),
+            "--backend",
+            "ascend",
+            "--dtype",
+            "f32",
+            "--device-id",
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Ascend backend unavailable; rebuild with --features ascend",
+        ));
 }
 
 #[test]
