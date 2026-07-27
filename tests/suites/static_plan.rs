@@ -1,11 +1,12 @@
 use omeinsum::static_plan::{
     allocate_live_ranges, benchmark_prepared, build_geometry_plan, build_plan_bundle,
-    build_plan_bundle_with_preprocessing, coalesce_permutation, contract_complex64,
-    decompose_permutation, green_operand_plane_batches, lower_plan_traces, plan_f32_arena,
-    prepare_cpu_f32, prepare_cpu_f64, ArenaSlot, BenchmarkConfig, BenchmarkTarget,
-    BinaryContractionTree, ComplexNetwork, ComplexTensor, ComplexValue, ExecutionError, InputSet,
-    InputTensor, KernelKind, LeafClass, LeafPreprocessing, LiveRange, PlanBundle, PlanStats, Plane,
-    PreparedExecutable, Representation, ScratchRole, StaticPlan, TensorSpec, ValueId, ValueSpec,
+    build_plan_bundle_with_preprocessing, build_sliced_plan_bundle, coalesce_permutation,
+    contract_complex64, decompose_permutation, gray_assignments, green_operand_plane_batches,
+    lower_plan_traces, plan_f32_arena, prepare_cpu_f32, prepare_cpu_f64, slice_inputs, ArenaSlot,
+    BenchmarkConfig, BenchmarkTarget, BinaryContractionTree, ComplexNetwork, ComplexTensor,
+    ComplexValue, ExecutionError, InputSet, InputTensor, KernelKind, LeafClass, LeafPreprocessing,
+    LiveRange, PlanBundle, PlanError, PlanStats, Plane, PreparedExecutable, Representation,
+    ScratchRole, SliceAssignmentOrder, SliceSpec, StaticPlan, TensorSpec, ValueId, ValueSpec,
 };
 use rand::{Rng, SeedableRng};
 use std::sync::{Arc, Mutex};
@@ -297,6 +298,7 @@ fn plan_bundle_round_trips_json() {
                 imag: vec![0.0],
                 class: LeafClass::Real,
                 imag_max: 0.0,
+                classification_imag_max: None,
             }],
         },
         real_skeleton: one_leaf_plan(Representation::RealSkeleton, "real", vec![Plane::Real]),
@@ -316,6 +318,361 @@ fn plan_bundle_round_trips_json() {
     let round_trip: PlanBundle = serde_json::from_str(&json).unwrap();
     assert_eq!(round_trip, bundle);
     assert_eq!(round_trip.format, "omeinsum-static-plan-v1");
+}
+
+#[test]
+fn sliced_classification_provenance_is_optional_and_freezes_source_class() {
+    let mut bundle = build_plan_bundle(&two_leaf_scalar_network(0.5, 0.0), 1e-12).unwrap();
+    let source_imag_max = bundle.inputs.tensors[0].imag_max;
+
+    let ordinary_json = serde_json::to_value(&bundle).unwrap();
+    assert!(ordinary_json["inputs"]["tensors"][0]
+        .get("classification_imag_max")
+        .is_none());
+
+    let sliced = &mut bundle.inputs.tensors[0];
+    sliced.imag.fill(0.0);
+    sliced.imag_max = 0.0;
+    sliced.classification_imag_max = Some(source_imag_max);
+
+    assert_eq!(sliced.class, LeafClass::Complex);
+    assert_eq!(sliced.imag_max, 0.0);
+    assert_eq!(sliced.classification_imag_max, Some(0.5));
+    bundle.validate().unwrap();
+    let sliced_json = serde_json::to_value(&bundle).unwrap();
+    assert_eq!(
+        sliced_json["inputs"]["tensors"][0]["classification_imag_max"],
+        0.5
+    );
+}
+
+#[test]
+fn sliced_gray_schedule_has_literal_binary_reflected_order() {
+    let spec = SliceSpec {
+        modes: vec![7, 9],
+        dimensions: vec![2, 2],
+        assignment_order: SliceAssignmentOrder::BinaryReflectedGray,
+        slice_count: 4,
+    };
+
+    assert_eq!(
+        gray_assignments(&spec).unwrap(),
+        vec![vec![0, 0], vec![0, 1], vec![1, 1], vec![1, 0]]
+    );
+}
+
+#[test]
+fn sliced_inputs_select_column_major_values_and_preserve_source_classes() {
+    let inputs = InputSet {
+        tensors: vec![
+            InputTensor {
+                spec: TensorSpec {
+                    modes: vec![1, 2, 3],
+                    shape: vec![2, 3, 2],
+                },
+                real: (0..12).map(f64::from).collect(),
+                imag: (100..112).map(f64::from).collect(),
+                class: LeafClass::Complex,
+                imag_max: 111.0,
+                classification_imag_max: None,
+            },
+            InputTensor {
+                spec: TensorSpec {
+                    modes: vec![2],
+                    shape: vec![3],
+                },
+                real: vec![20.0, 21.0, 22.0],
+                imag: vec![0.0, 0.0, 0.0],
+                class: LeafClass::Real,
+                imag_max: 0.0,
+                classification_imag_max: None,
+            },
+            InputTensor {
+                spec: TensorSpec {
+                    modes: vec![1],
+                    shape: vec![2],
+                },
+                real: vec![30.0, 31.0],
+                imag: vec![0.0, 0.0],
+                class: LeafClass::Real,
+                imag_max: 0.0,
+                classification_imag_max: None,
+            },
+        ],
+    };
+    let spec = SliceSpec {
+        modes: vec![1, 3],
+        dimensions: vec![2, 2],
+        assignment_order: SliceAssignmentOrder::BinaryReflectedGray,
+        slice_count: 4,
+    };
+
+    let sliced = slice_inputs(&inputs, &spec, &[1, 0]).unwrap();
+
+    assert_eq!(sliced.tensors[0].spec.modes, vec![1, 2, 3]);
+    assert_eq!(sliced.tensors[0].spec.shape, vec![1, 3, 1]);
+    assert_eq!(sliced.tensors[0].real, vec![1.0, 3.0, 5.0]);
+    assert_eq!(sliced.tensors[0].imag, vec![101.0, 103.0, 105.0]);
+    assert_eq!(sliced.tensors[0].imag_max, 105.0);
+    assert_eq!(sliced.tensors[0].classification_imag_max, Some(111.0));
+    assert_eq!(sliced.tensors[0].class, LeafClass::Complex);
+    assert_eq!(sliced.tensors[1], inputs.tensors[1]);
+    assert_eq!(sliced.tensors[2].spec.shape, vec![1]);
+    assert_eq!(sliced.tensors[2].real, vec![31.0]);
+    assert_eq!(sliced.tensors[2].imag, vec![0.0]);
+}
+
+#[test]
+fn sliced_inputs_reject_a_declared_dimension_that_disagrees_with_the_source() {
+    let inputs = InputSet {
+        tensors: vec![InputTensor {
+            spec: TensorSpec {
+                modes: vec![7],
+                shape: vec![3],
+            },
+            real: vec![1.0, 2.0, 3.0],
+            imag: vec![0.0; 3],
+            class: LeafClass::Real,
+            imag_max: 0.0,
+            classification_imag_max: None,
+        }],
+    };
+    let spec = SliceSpec {
+        modes: vec![7],
+        dimensions: vec![2],
+        assignment_order: SliceAssignmentOrder::BinaryReflectedGray,
+        slice_count: 2,
+    };
+
+    let error = slice_inputs(&inputs, &spec, &[1]).unwrap_err();
+
+    match error {
+        PlanError::InvalidTensor { index, detail } => {
+            assert_eq!(index, 0);
+            assert_eq!(
+                detail,
+                "slice mode 7 has source dimension 3 but the slice spec declares 2"
+            );
+        }
+        other => panic!("expected an invalid tensor error, got {other:?}"),
+    }
+}
+
+#[test]
+fn sliced_plan_rebuilds_geometry_without_changing_tree_or_leaf_classes() {
+    let source = build_plan_bundle(&matrix_scalar_network(0.5, 0.25), 1e-12).unwrap();
+
+    let sliced = build_sliced_plan_bundle(&source, &[0, 2]).unwrap();
+
+    assert_eq!(sliced.format, "omeinsum-sliced-plan-v1");
+    assert_eq!(sliced.source_tree_hash, source.tree_hash);
+    assert_eq!(sliced.reduced.tree_hash, source.tree_hash);
+    assert_eq!(sliced.slice.modes, vec![0, 2]);
+    assert_eq!(sliced.slice.dimensions, vec![2, 2]);
+    assert_eq!(sliced.slice.slice_count, 4);
+    assert_eq!(
+        sliced
+            .source_inputs
+            .tensors
+            .iter()
+            .map(|tensor| tensor.class.clone())
+            .collect::<Vec<_>>(),
+        sliced
+            .reduced
+            .inputs
+            .tensors
+            .iter()
+            .map(|tensor| tensor.class.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sliced
+            .reduced
+            .realified_rank3
+            .nodes
+            .iter()
+            .map(|node| node.kind.clone())
+            .collect::<Vec<_>>(),
+        source
+            .realified_rank3
+            .nodes
+            .iter()
+            .map(|node| node.kind.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        sliced.reduced.realified_rank3.plan_hash,
+        source.realified_rank3.plan_hash
+    );
+    assert_eq!(sliced.reduced.inputs.tensors[0].spec.shape, vec![1, 2]);
+    assert_eq!(sliced.reduced.inputs.tensors[1].spec.shape, vec![2, 1]);
+    assert_eq!(sliced.reduced.inputs.tensors[2].spec.shape, vec![1, 1]);
+    assert_eq!(
+        sliced
+            .aggregate_volumes
+            .iter()
+            .map(|volume| (
+                volume.representation.clone(),
+                volume.source_real_matmul_volume,
+                volume.sliced_real_matmul_volume,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (Representation::RealSkeleton, 12, 12),
+            (Representation::Flat4M, 48, 48),
+            (Representation::RealifiedRank3, 32, 32),
+        ]
+    );
+    sliced.validate().unwrap();
+}
+
+#[test]
+fn sliced_complex_flat_and_rank3_sums_match_unsliced_values() {
+    let source = build_plan_bundle(&matrix_scalar_network(0.5, 0.25), 1e-12).unwrap();
+    let sliced = build_sliced_plan_bundle(&source, &[0, 2]).unwrap();
+    let unsliced_reference = contract_complex64(&source.flat_4m, &source.inputs).unwrap();
+    let mut sliced_reference = ComplexValue { re: 0.0, im: 0.0 };
+    let mut sliced_flat = ComplexValue { re: 0.0, im: 0.0 };
+    let mut sliced_rank3 = ComplexValue { re: 0.0, im: 0.0 };
+
+    for assignment in gray_assignments(&sliced.slice).unwrap() {
+        let inputs = slice_inputs(&sliced.source_inputs, &sliced.slice, &assignment).unwrap();
+        let reference = contract_complex64(&sliced.reduced.flat_4m, &inputs).unwrap();
+        sliced_reference.re += reference.re;
+        sliced_reference.im += reference.im;
+
+        for (plan, sum) in [
+            (&sliced.reduced.flat_4m, &mut sliced_flat),
+            (&sliced.reduced.realified_rank3, &mut sliced_rank3),
+        ] {
+            let mut executable = prepare_cpu_f64(plan, &inputs).unwrap();
+            executable.enqueue().unwrap();
+            executable.synchronize().unwrap();
+            let output = executable.output().unwrap();
+            sum.re += output.re;
+            sum.im += output.im;
+        }
+    }
+
+    for observed in [sliced_reference, sliced_flat, sliced_rank3] {
+        assert!((observed.re - unsliced_reference.re).abs() <= 1e-12);
+        assert!((observed.im - unsliced_reference.im).abs() <= 1e-12);
+    }
+}
+
+#[test]
+fn sliced_phase_canonicalized_plan_preserves_preprocessing_classes_and_scalar() {
+    let network = phase_real_two_leaf_network(std::f64::consts::FRAC_PI_4, 0.0, true);
+    let source = build_plan_bundle_with_preprocessing(
+        &network,
+        1e-12,
+        LeafPreprocessing::PhaseCanonicalized,
+    )
+    .unwrap();
+    let sliced = build_sliced_plan_bundle(&source, &[0]).unwrap();
+
+    assert_eq!(
+        sliced.reduced.leaf_preprocessing,
+        LeafPreprocessing::PhaseCanonicalized
+    );
+    assert_eq!(
+        sliced.reduced.phase_canonicalization,
+        source.phase_canonicalization
+    );
+    assert_eq!(
+        sliced
+            .reduced
+            .inputs
+            .tensors
+            .iter()
+            .map(|tensor| tensor.class.clone())
+            .collect::<Vec<_>>(),
+        vec![LeafClass::Real, LeafClass::Complex]
+    );
+    assert_eq!(
+        sliced
+            .reduced
+            .realified_rank3
+            .nodes
+            .iter()
+            .map(|node| node.kind.clone())
+            .collect::<Vec<_>>(),
+        source
+            .realified_rank3
+            .nodes
+            .iter()
+            .map(|node| node.kind.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let expected = contract_complex64(&source.flat_4m, &source.inputs).unwrap();
+    let mut observed = ComplexValue { re: 0.0, im: 0.0 };
+    for assignment in gray_assignments(&sliced.slice).unwrap() {
+        let inputs = slice_inputs(&sliced.source_inputs, &sliced.slice, &assignment).unwrap();
+        let mut executable = prepare_cpu_f64(&sliced.reduced.realified_rank3, &inputs).unwrap();
+        executable.enqueue().unwrap();
+        executable.synchronize().unwrap();
+        let value = executable.output().unwrap();
+        observed.re += value.re;
+        observed.im += value.im;
+    }
+
+    assert!((observed.re - expected.re).abs() <= 1e-12);
+    assert!((observed.im - expected.im).abs() <= 1e-12);
+}
+
+#[test]
+fn sliced_plan_rejects_duplicate_missing_or_nonbinary_physical_modes() {
+    let source = build_plan_bundle(&matrix_scalar_network(0.5, 0.25), 1e-12).unwrap();
+    assert!(matches!(
+        build_sliced_plan_bundle(&source, &[0, 0]),
+        Err(PlanError::InvalidNetwork(detail)) if detail == "slice modes must be unique"
+    ));
+    assert!(matches!(
+        build_sliced_plan_bundle(&source, &[99]),
+        Err(PlanError::InvalidNetwork(detail)) if detail == "slice mode 99 is absent"
+    ));
+
+    let mut dimension_one = two_leaf_scalar_network(0.5, 0.25);
+    dimension_one.tensors[0].spec.shape = vec![1];
+    dimension_one.tensors[0].real.truncate(1);
+    dimension_one.tensors[0].imag.truncate(1);
+    dimension_one.tensors[1].spec.shape = vec![1];
+    dimension_one.tensors[1].real.truncate(1);
+    dimension_one.tensors[1].imag.truncate(1);
+    dimension_one.size_dict = vec![(0, 1)];
+    let dimension_one = build_plan_bundle(&dimension_one, 1e-12).unwrap();
+    assert!(matches!(
+        build_sliced_plan_bundle(&dimension_one, &[0]),
+        Err(PlanError::InvalidNetwork(detail))
+            if detail == "slice mode 0 has dimension 1; expected 2"
+    ));
+}
+
+#[test]
+fn sliced_gray_schedule_rejects_inconsistent_and_overflowing_specs() {
+    let inconsistent = SliceSpec {
+        modes: vec![7, 9],
+        dimensions: vec![2],
+        assignment_order: SliceAssignmentOrder::BinaryReflectedGray,
+        slice_count: 4,
+    };
+    assert!(matches!(
+        gray_assignments(&inconsistent),
+        Err(PlanError::InvalidNetwork(detail))
+            if detail == "slice modes and dimensions must have the same nonzero length"
+    ));
+
+    let overflow = SliceSpec {
+        modes: (0..usize::BITS).map(|mode| mode as i32).collect(),
+        dimensions: vec![2; usize::BITS as usize],
+        assignment_order: SliceAssignmentOrder::BinaryReflectedGray,
+        slice_count: 0,
+    };
+    assert!(matches!(
+        gray_assignments(&overflow),
+        Err(PlanError::InvalidNetwork(detail)) if detail == "slice count overflows usize"
+    ));
 }
 
 #[test]

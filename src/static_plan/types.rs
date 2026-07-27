@@ -39,6 +39,38 @@ pub enum LeafClass {
     Complex,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SliceAssignmentOrder {
+    BinaryReflectedGray,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceSpec {
+    pub modes: Vec<i32>,
+    pub dimensions: Vec<usize>,
+    pub assignment_order: SliceAssignmentOrder,
+    pub slice_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlicedVolume {
+    pub representation: Representation,
+    pub source_real_matmul_volume: u128,
+    pub sliced_real_matmul_volume: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlicedPlanBundle {
+    pub format: String,
+    pub source_tree_hash: String,
+    pub source_plan_hashes: Vec<(Representation, String)>,
+    pub source_inputs: InputSet<f64>,
+    pub slice: SliceSpec,
+    pub reduced: PlanBundle,
+    pub aggregate_volumes: Vec<SlicedVolume>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LeafPreprocessing {
@@ -74,6 +106,8 @@ pub struct InputTensor<T> {
     pub imag: Vec<T>,
     pub class: LeafClass,
     pub imag_max: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_imag_max: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -125,7 +125,7 @@ pub fn build_plan_bundle_with_preprocessing(
     Ok(bundle)
 }
 
-fn configure_real_skeleton(
+pub(super) fn configure_real_skeleton(
     mut plan: StaticPlan,
     real_leaf_count: usize,
     complex_leaf_count: usize,
@@ -154,7 +154,7 @@ fn configure_real_skeleton(
     Ok(plan)
 }
 
-fn configure_flat_4m(
+pub(super) fn configure_flat_4m(
     mut plan: StaticPlan,
     real_leaf_count: usize,
     complex_leaf_count: usize,
@@ -200,7 +200,7 @@ fn configure_flat_4m(
     Ok(plan)
 }
 
-fn configure_selective(
+pub(super) fn configure_selective(
     mut plan: StaticPlan,
     inputs: &InputSet<f64>,
     real_leaf_count: usize,
@@ -1015,6 +1015,9 @@ impl PlanBundle {
                 .any(|value| !value.is_finite())
                 || !input.imag_max.is_finite()
                 || input.imag_max < 0.0
+                || input
+                    .classification_imag_max
+                    .is_some_and(|value| !value.is_finite() || value < 0.0)
             {
                 return Err(PlanError::InvalidTensor {
                     index,
@@ -1024,7 +1027,8 @@ impl PlanBundle {
             match input.class {
                 LeafClass::Real => {
                     real_count += 1;
-                    if input.imag_max > self.realness_tol
+                    if input.classification_imag_max.is_some()
+                        || input.imag_max > self.realness_tol
                         || input.imag.iter().any(|value| *value != 0.0)
                     {
                         return Err(PlanError::InvalidTensor {
@@ -1040,7 +1044,12 @@ impl PlanBundle {
                         .iter()
                         .map(|value| value.abs())
                         .fold(0.0_f64, f64::max);
-                    if input.imag_max <= self.realness_tol || observed != input.imag_max {
+                    let classification_imag_max =
+                        input.classification_imag_max.unwrap_or(input.imag_max);
+                    if classification_imag_max <= self.realness_tol
+                        || observed != input.imag_max
+                        || input.imag_max > classification_imag_max
+                    {
                         return Err(PlanError::InvalidTensor {
                             index,
                             detail: "complex leaf imag_max is inconsistent".to_string(),

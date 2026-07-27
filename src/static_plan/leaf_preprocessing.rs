@@ -121,6 +121,7 @@ fn classify_raw_inputs(
                 imag,
                 class,
                 imag_max,
+                classification_imag_max: None,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
