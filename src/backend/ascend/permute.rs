@@ -8,7 +8,11 @@ use crate::backend::{
     contract_plan::{materialize_strided, plan_permutation_steps},
     Storage,
 };
-use std::{ptr, sync::Arc};
+use std::{
+    collections::HashMap,
+    ptr,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 const ACLNN_PERMUTE_MAX_RANK: usize = 8;
 
@@ -150,7 +154,30 @@ pub(crate) fn materialize(
     match route_permutation(source.len(), shape, strides, permutation)? {
         PermuteRoute::Single(plan) => materialize_dense(runtime, source, plan),
         PermuteRoute::Steps(steps) => {
-            let verify = std::env::var_os("OMEINSUM_PERMUTE_VERIFY").is_some();
+            // CANN silently mis-executes aclnnPermute for specific shape/dims
+            // combinations beyond its rank limit (observed: rank-8 merged-view
+            // plan [2,2,2,2,16,4,2,128] x dims [4,0,5,1,6,2,7,3] on CANN 8.5,
+            // 99.9% of elements misplaced). The mis-fire region is a black
+            // box, so the first execution of every unique high-rank
+            // permutation is verified bitwise against the host materializer;
+            // failing signatures permanently fall back to the host path.
+            let key = (
+                shape.to_vec(),
+                strides.to_vec(),
+                permutation.to_vec(),
+            );
+            let verdict = verify_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .copied();
+            if verdict == Some(false) {
+                let host = source.to_vec()?;
+                return AscendStorage::upload(
+                    runtime.clone(),
+                    &materialize_strided(&host, shape, strides, permutation),
+                );
+            }
             let mut iter = steps.into_iter();
             let first = iter
                 .next()
@@ -159,14 +186,21 @@ pub(crate) fn materialize(
             for step in iter {
                 current = materialize_dense(runtime, &current, step)?;
             }
-            if verify {
+            if verdict.is_none() {
                 let device = current.to_vec()?;
                 let host_source = source.to_vec()?;
                 let expected = materialize_strided(&host_source, shape, strides, permutation);
-                assert_eq!(
-                    device, expected,
-                    "decomposed permute diverged on device: shape={shape:?} strides={strides:?} permutation={permutation:?}"
-                );
+                let good = device == expected;
+                verify_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, good);
+                if !good {
+                    eprintln!(
+                        "aclnnPermute mis-executed a decomposed plan; falling back to host for this permutation"
+                    );
+                    return AscendStorage::upload(runtime.clone(), &expected);
+                }
             }
             Ok(current)
         }
@@ -178,6 +212,14 @@ pub(crate) fn materialize(
             )
         }
     }
+}
+
+/// Per-process verdicts of the first execution of each unique high-rank
+/// permutation (see the Steps arm of `materialize`).
+type Signature = (Vec<usize>, Vec<usize>, Vec<usize>);
+static VERIFY_CACHE: OnceLock<Mutex<HashMap<Signature, bool>>> = OnceLock::new();
+fn verify_cache() -> &'static Mutex<HashMap<Signature, bool>> {
+    VERIFY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// How a strided-view materialization can be executed.
