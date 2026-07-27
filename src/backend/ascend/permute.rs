@@ -429,4 +429,73 @@ mod tests {
             PermuteRoute::Host
         ));
     }
+
+    /// Device probe (runs only where an Ascend device exists): execute single
+    /// aclnnPermute plans through materialize_dense and compare with the host
+    /// reference. Maps which (input_shape, dims) CANN executes incorrectly —
+    /// the W8 cliff fix depends on knowing this constraint exactly.
+    #[test]
+    fn device_permute_sweep_matches_host() {
+        let runtime = match Runtime::new(0) {
+            Ok(runtime) => std::sync::Arc::new(runtime),
+            Err(error) => {
+                eprintln!("no Ascend device available, skipping probe: {error}");
+                return;
+            }
+        };
+        let cases: Vec<(Vec<usize>, Vec<i64>)> = vec![
+            // A: the exact case caught by OMEINSUM_PERMUTE_VERIFY (FAIL expected)
+            (vec![2, 2, 2, 2, 16, 4, 2, 128], vec![4, 0, 5, 1, 6, 2, 7, 3]),
+            // B: same dims, smaller merged extents
+            (vec![2, 2, 2, 2, 4, 4, 2, 8], vec![4, 0, 5, 1, 6, 2, 7, 3]),
+            // C: same dims, shrink only the 128-extent axis
+            (vec![2, 2, 2, 2, 16, 4, 2, 16], vec![4, 0, 5, 1, 6, 2, 7, 3]),
+            // D: same dims, 128 -> 64
+            (vec![2, 2, 2, 2, 16, 4, 2, 64], vec![4, 0, 5, 1, 6, 2, 7, 3]),
+            // E: same shape as A, identity dims (control)
+            (vec![2, 2, 2, 2, 16, 4, 2, 128], vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            // F: same dims as A, all-2 extents (W7-style full axes)
+            (vec![2, 2, 2, 2, 2, 2, 2, 2], vec![4, 0, 5, 1, 6, 2, 7, 3]),
+            // G: same shape as A, full reverse dims
+            (vec![2, 2, 2, 2, 16, 4, 2, 128], vec![7, 6, 5, 4, 3, 2, 1, 0]),
+            // H: rank-8 case that verified OK on device in the verify run
+            (vec![2, 2, 64, 2, 2, 2, 2, 2], vec![1, 5, 7, 0, 2, 4, 6, 3]),
+            // I: big axis is the innermost input and stays innermost
+            (vec![2, 2, 2, 2, 16, 4, 2, 128], vec![0, 1, 2, 3, 5, 4, 6, 7]),
+            // J: big innermost axis moves out (extent 2 in, big stays)
+            (vec![2, 2, 2, 2, 16, 4, 128, 2], vec![4, 0, 5, 1, 6, 2, 7, 3]),
+        ];
+        let mut failures = 0;
+        for (index, (input_shape, dims)) in cases.iter().enumerate() {
+            let numel: usize = input_shape.iter().product();
+            let data: Vec<f32> = (0..numel).map(|x| x as f32).collect();
+            let source = AscendStorage::upload(runtime.clone(), &data)
+                .expect("upload probe tensor");
+            let output_shape: Vec<usize> =
+                dims.iter().map(|&d| input_shape[d as usize]).collect();
+            let plan = DensePermutation {
+                input_shape: input_shape.clone(),
+                output_shape,
+                dims: dims.clone(),
+            };
+            let device = materialize_dense(&runtime, &source, plan)
+                .and_then(|output| output.to_vec())
+                .expect("device permute");
+            let expected = apply_row_major_permutation(&data, input_shape, dims);
+            if device == expected {
+                println!("case {index}: PASS shape={input_shape:?} dims={dims:?}");
+            } else {
+                failures += 1;
+                let mismatches = device
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                println!(
+                    "case {index}: FAIL shape={input_shape:?} dims={dims:?} mismatches={mismatches}/{numel}"
+                );
+            }
+        }
+        assert_eq!(failures, 0, "{failures} probe cases diverged on device");
+    }
 }
