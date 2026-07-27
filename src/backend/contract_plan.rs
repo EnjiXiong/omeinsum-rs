@@ -633,6 +633,62 @@ mod tests {
     }
 
     #[test]
+    fn high_rank_random_strides_match_host() {
+        // Contiguous but non-canonical layouts: any axis order can be the
+        // physical one. The planner must handle whatever the contraction
+        // planner hands it.
+        let mut state = 0xdeadbeefcafef00du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for rank in [9usize, 11, 14] {
+            for _ in 0..16 {
+                let shape = vec![2usize; rank];
+                // Random physical layout (memory order of axes).
+                let mut layout: Vec<usize> = (0..rank).collect();
+                for i in (1..rank).rev() {
+                    let j = next() % (i + 1);
+                    layout.swap(i, j);
+                }
+                let mut strides = vec![0usize; rank];
+                let mut stride = 1usize;
+                for &axis in &layout {
+                    strides[axis] = stride;
+                    stride *= shape[axis];
+                }
+                let mut permutation: Vec<usize> = (0..rank).collect();
+                for i in (1..rank).rev() {
+                    let j = next() % (i + 1);
+                    permutation.swap(i, j);
+                }
+                let numel: usize = shape.iter().product();
+                let data: Vec<i64> = (0..numel as i64).collect();
+                let input_axes: Vec<usize> = layout.iter().rev().copied().collect();
+                let output_axes: Vec<usize> = permutation.iter().rev().copied().collect();
+                if input_axes == output_axes {
+                    continue; // identity handled by callers
+                }
+                let steps =
+                    plan_permutation_steps(&shape, &input_axes, &output_axes, 8);
+                let mut current = data.clone();
+                for step in &steps {
+                    assert!(step.input_shape.len() <= 8);
+                    current = apply_row_major_permutation(
+                        &current,
+                        &step.input_shape,
+                        &step.dims,
+                    );
+                }
+                let expected = materialize_strided(&data, &shape, &strides, &permutation);
+                assert_eq!(current, expected, "rank {rank}, layout {layout:?}");
+            }
+        }
+    }
+
+    #[test]
     fn high_rank_random_permutations_match_host() {
         // Simple LCG so the test needs no extra dependencies.
         let mut state = 0x9e3779b97f4a7c15u64;

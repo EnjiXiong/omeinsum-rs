@@ -219,6 +219,15 @@ fn route_permutation(
         // the defensive answer.
         return Ok(PermuteRoute::Host);
     }
+    // Row-major picture, as in dense_permutation: physical input order and the
+    // requested output order, both in original axis ids.
+    let input_axes: Vec<usize> = physical_axes.into_iter().rev().collect();
+    let output_axes: Vec<usize> = permutation.iter().rev().copied().collect();
+    if input_axes == output_axes {
+        // Identity permutations are handled by callers; keep the host path as
+        // the defensive answer.
+        return Ok(PermuteRoute::Host);
+    }
     let steps = plan_permutation_steps(shape, &input_axes, &output_axes, ACLNN_PERMUTE_MAX_RANK)
         .into_iter()
         .map(|step| DensePermutation {
@@ -226,7 +235,20 @@ fn route_permutation(
             output_shape: step.output_shape,
             dims: step.dims,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if std::env::var_os("OMEINSUM_DEBUG_PERMUTE").is_some() {
+        eprintln!(
+            "permute rank {}: shape={shape:?} strides={strides:?} permutation={permutation:?} steps={}",
+            shape.len(),
+            steps.len()
+        );
+        for (i, step) in steps.iter().enumerate() {
+            eprintln!(
+                "  step {i}: in={:?} out={:?} dims={:?}",
+                step.input_shape, step.output_shape, step.dims
+            );
+        }
+    }
     Ok(PermuteRoute::Steps(steps))
 }
 
