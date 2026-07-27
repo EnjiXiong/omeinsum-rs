@@ -150,6 +150,7 @@ pub(crate) fn materialize(
     match route_permutation(source.len(), shape, strides, permutation)? {
         PermuteRoute::Single(plan) => materialize_dense(runtime, source, plan),
         PermuteRoute::Steps(steps) => {
+            let verify = std::env::var_os("OMEINSUM_PERMUTE_VERIFY").is_some();
             let mut iter = steps.into_iter();
             let first = iter
                 .next()
@@ -157,6 +158,15 @@ pub(crate) fn materialize(
             let mut current = materialize_dense(runtime, source, first)?;
             for step in iter {
                 current = materialize_dense(runtime, &current, step)?;
+            }
+            if verify {
+                let device = current.to_vec()?;
+                let host_source = source.to_vec()?;
+                let expected = materialize_strided(&host_source, shape, strides, permutation);
+                assert_eq!(
+                    device, expected,
+                    "decomposed permute diverged on device: shape={shape:?} strides={strides:?} permutation={permutation:?}"
+                );
             }
             Ok(current)
         }
