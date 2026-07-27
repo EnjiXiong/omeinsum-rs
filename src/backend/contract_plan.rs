@@ -399,9 +399,263 @@ pub(crate) fn plan_contraction(
     }
 }
 
+/// One device-executable step of a decomposed high-rank permutation: merge
+/// consecutive axes into super-axes by free reshapes, then permute the
+/// super-axes (at most `max_rank` of them) in one backend permute call.
+///
+/// Backend-neutral: the Ascend backend caps aclnnPermute at rank 8 and
+/// executes these steps on-device instead of round-tripping through the host
+/// (campaign W8). `dims[i]` gives the input super-axis that becomes output
+/// super-axis `i` (aclnnPermute / numpy.transpose semantics).
+#[cfg(any(feature = "ascend", feature = "ascend-tropical", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PermuteStep {
+    pub input_shape: Vec<usize>,
+    pub output_shape: Vec<usize>,
+    pub dims: Vec<i64>,
+}
+
+/// Plan a permutation as a chain of steps whose view rank never exceeds
+/// `max_rank`, working in a row-major physical picture: `input_axes` is the
+/// current memory order of the (original) axes, `output_axes` the desired
+/// one, and `shape` the extent of each original axis.
+///
+/// Fast path: if the current order decomposes into at most `max_rank` *runs*
+/// (maximal segments whose axes stay consecutive in the target), a single
+/// permute of the merged view finishes. General path: repeatedly place the
+/// next three target axes (the already-placed prefix and the untouched gaps
+/// merge into at most 1 + 3 + 4 super-axes), terminating in at most
+/// ceil(n/3) steps. Each step's output is contiguous in the new axis order
+/// and becomes the next step's input.
+#[cfg(any(feature = "ascend", feature = "ascend-tropical", test))]
+pub(crate) fn plan_permutation_steps(
+    shape: &[usize],
+    input_axes: &[usize],
+    output_axes: &[usize],
+    max_rank: usize,
+) -> Vec<PermuteStep> {
+    let n = input_axes.len();
+    debug_assert!(max_rank >= 4);
+    debug_assert!(n <= 64);
+    let position: Vec<usize> = {
+        let mut p = vec![0usize; n];
+        for (i, &axis) in output_axes.iter().enumerate() {
+            p[axis] = i;
+        }
+        p
+    };
+    let make_step = |groups: &[Vec<usize>], order: &[usize]| -> PermuteStep {
+        let view_shapes: Vec<usize> = groups
+            .iter()
+            .map(|group| group.iter().map(|&axis| shape[axis]).product())
+            .collect();
+        PermuteStep {
+            output_shape: order.iter().map(|&i| view_shapes[i]).collect(),
+            input_shape: view_shapes,
+            dims: order.iter().map(|&i| i as i64).collect(),
+        }
+    };
+    let mut current: Vec<usize> = input_axes.to_vec();
+    let target: Vec<usize> = output_axes.to_vec();
+    let mut steps = Vec::new();
+    while current != target {
+        // Runs of `current` preserved (consecutively, in order) in `target`.
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        for &axis in &current {
+            let extends = matches!(
+                runs.last(),
+                Some(last) if position[*last.last().unwrap()] + 1 == position[axis]
+            );
+            if extends {
+                runs.last_mut().unwrap().push(axis);
+            } else {
+                runs.push(vec![axis]);
+            }
+        }
+        if runs.len() <= max_rank {
+            let mut order: Vec<usize> = (0..runs.len()).collect();
+            order.sort_by_key(|&r| position[runs[r][0]]);
+            steps.push(make_step(&runs, &order));
+            break;
+        }
+        // Place the next k target axes (k <= 3): the placed prefix merges
+        // into one super-axis, each wanted axis is its own super-axis, and
+        // the untouched gaps merge into at most k + 1 super-axes.
+        let placed = current
+            .iter()
+            .zip(&target)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let k = 3usize.min(n - placed);
+        let want: Vec<usize> = target[placed..placed + k].to_vec();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut gap_indices: Vec<usize> = Vec::new();
+        if placed > 0 {
+            groups.push(current[..placed].to_vec());
+        }
+        // State machine over the remaining axes: wanted axes become
+        // singleton groups and close the current gap run; other axes extend
+        // the open gap run or start a new one.
+        let mut gap_open = false;
+        for &axis in &current[placed..] {
+            if want.contains(&axis) {
+                groups.push(vec![axis]);
+                gap_open = false;
+            } else if gap_open {
+                groups.last_mut().unwrap().push(axis);
+            } else {
+                groups.push(vec![axis]);
+                gap_indices.push(groups.len() - 1);
+                gap_open = true;
+            }
+        }
+        debug_assert!(groups.len() <= max_rank);
+        // New order: prefix, wanted axes in target order, gaps in scan order.
+        let group_of = |axis: usize| {
+            groups
+                .iter()
+                .position(|group| group.contains(&axis))
+                .expect("every axis belongs to a group")
+        };
+        let mut order: Vec<usize> = Vec::new();
+        if placed > 0 {
+            order.push(0);
+        }
+        order.extend(want.iter().map(|&axis| group_of(axis)));
+        order.extend(gap_indices);
+        steps.push(make_step(&groups, &order));
+        current = order
+            .iter()
+            .flat_map(|&i| groups[i].iter().copied())
+            .collect();
+    }
+    debug_assert!(
+        steps.windows(2).all(|w| {
+            w[0].output_shape.iter().product::<usize>() == w[1].input_shape.iter().product::<usize>()
+        }),
+        "decomposed steps must chain (regrouping preserves the element count)"
+    );
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apply_row_major_permutation<T: Copy + Default>(
+        input: &[T],
+        input_shape: &[usize],
+        dims: &[i64],
+    ) -> Vec<T> {
+        let output_shape: Vec<usize> = dims
+            .iter()
+            .map(|&axis| input_shape[usize::try_from(axis).unwrap()])
+            .collect();
+        let mut output = vec![T::default(); input.len()];
+        for (output_linear, value) in output.iter_mut().enumerate() {
+            let mut remaining = output_linear;
+            let mut input_coordinates = vec![0usize; input_shape.len()];
+            for output_axis in (0..output_shape.len()).rev() {
+                let coordinate = remaining % output_shape[output_axis];
+                remaining /= output_shape[output_axis];
+                input_coordinates[usize::try_from(dims[output_axis]).unwrap()] = coordinate;
+            }
+            let input_linear = input_coordinates
+                .iter()
+                .zip(input_shape)
+                .fold(0usize, |linear, (&coordinate, &extent)| {
+                    linear * extent + coordinate
+                });
+            *value = input[input_linear];
+        }
+        output
+    }
+
+    fn canonical_strides(shape: &[usize]) -> Vec<usize> {
+        let mut strides = Vec::with_capacity(shape.len());
+        let mut stride = 1usize;
+        for &extent in shape {
+            strides.push(stride);
+            stride *= extent;
+        }
+        strides
+    }
+
+    /// Simulate the step chain on data and check it against the host
+    /// materializer's ground truth; returns the number of device steps.
+    fn steps_match_host(shape: &[usize], permutation: &[usize]) -> usize {
+        const MAX_RANK: usize = 8;
+        let strides = canonical_strides(shape);
+        let numel: usize = shape.iter().product();
+        // Row-major physical input order and requested output order, matching
+        // the backend's conversion (physical axes by stride, both reversed).
+        let input_axes: Vec<usize> = (0..shape.len()).rev().collect();
+        let output_axes: Vec<usize> = permutation.iter().rev().copied().collect();
+        let steps = plan_permutation_steps(shape, &input_axes, &output_axes, MAX_RANK);
+        assert!(!steps.is_empty());
+        let data: Vec<i64> = (0..numel as i64).collect();
+        let mut current = data.clone();
+        for (i, step) in steps.iter().enumerate() {
+            assert!(
+                step.input_shape.len() <= MAX_RANK,
+                "step {i} exceeds device rank"
+            );
+            current = apply_row_major_permutation(&current, &step.input_shape, &step.dims);
+        }
+        let expected = materialize_strided(&data, shape, &strides, permutation);
+        assert_eq!(current, expected);
+        steps.len()
+    }
+
+    #[test]
+    fn high_rank_runs_merge_into_single_step() {
+        // Move one axis into the middle: three runs, one device step.
+        let shape = [2, 2, 2, 3, 2, 2, 2, 2, 3, 2];
+        let permutation = [0, 1, 2, 3, 9, 4, 5, 6, 7, 8];
+        assert_eq!(steps_match_host(&shape, &permutation), 1);
+    }
+
+    #[test]
+    fn high_rank_full_reverse_decomposes() {
+        let shape = [2, 3, 2, 2, 3, 2, 2, 2, 3, 2, 2, 2];
+        let mut permutation: Vec<usize> = (0..shape.len()).collect();
+        permutation.reverse();
+        let steps = steps_match_host(&shape, &permutation);
+        assert!((2..=6).contains(&steps), "reverse took {steps} steps");
+    }
+
+    #[test]
+    fn high_rank_rotation_is_cheap() {
+        let shape = [2, 2, 3, 2, 2, 2, 3, 2, 2, 2, 2];
+        let mut permutation: Vec<usize> = (0..shape.len()).collect();
+        permutation.rotate_left(1);
+        assert_eq!(steps_match_host(&shape, &permutation), 1);
+    }
+
+    #[test]
+    fn high_rank_random_permutations_match_host() {
+        // Simple LCG so the test needs no extra dependencies.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for (rank, case) in [(9usize, 0), (12, 1), (16, 2), (13, 3)] {
+            let mut shape = vec![2usize; rank];
+            shape[case % rank] = 3;
+            for _ in 0..8 {
+                let mut permutation: Vec<usize> = (0..rank).collect();
+                for i in (1..rank).rev() {
+                    let j = next() % (i + 1);
+                    permutation.swap(i, j);
+                }
+                let steps = steps_match_host(&shape, &permutation);
+                assert!(steps <= rank / 3 + 2, "rank {rank}: {steps} steps");
+            }
+        }
+    }
 
     #[test]
     fn plain_matmul_ik_kj_to_ij() {

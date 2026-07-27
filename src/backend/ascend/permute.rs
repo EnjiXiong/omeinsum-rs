@@ -4,7 +4,10 @@ use super::{
     storage::AscendStorage,
     sys, AscendError,
 };
-use crate::backend::{contract_plan::materialize_strided, Storage};
+use crate::backend::{
+    contract_plan::{materialize_strided, plan_permutation_steps},
+    Storage,
+};
 use std::{ptr, sync::Arc};
 
 const ACLNN_PERMUTE_MAX_RANK: usize = 8;
@@ -144,14 +147,87 @@ pub(crate) fn materialize(
     strides: &[usize],
     permutation: &[usize],
 ) -> Result<AscendStorage<f32>, AscendError> {
-    if let Some(plan) = dense_permutation(source.len(), shape, strides, permutation)? {
-        return materialize_dense(runtime, source, plan);
+    match route_permutation(source.len(), shape, strides, permutation)? {
+        PermuteRoute::Single(plan) => materialize_dense(runtime, source, plan),
+        PermuteRoute::Steps(steps) => {
+            let mut iter = steps.into_iter();
+            let first = iter
+                .next()
+                .expect("decomposed permutation has at least one step");
+            let mut current = materialize_dense(runtime, source, first)?;
+            for step in iter {
+                current = materialize_dense(runtime, &current, step)?;
+            }
+            Ok(current)
+        }
+        PermuteRoute::Host => {
+            let host = source.to_vec()?;
+            AscendStorage::upload(
+                runtime.clone(),
+                &materialize_strided(&host, shape, strides, permutation),
+            )
+        }
     }
-    let host = source.to_vec()?;
-    AscendStorage::upload(
-        runtime.clone(),
-        &materialize_strided(&host, shape, strides, permutation),
-    )
+}
+
+/// How a strided-view materialization can be executed.
+enum PermuteRoute {
+    /// One aclnnPermute call (rank <= 8).
+    Single(DensePermutation),
+    /// A chain of aclnnPermute calls, each rank <= 8, for high-rank views
+    /// (W8: replaces the host round trip through the CPU).
+    Steps(Vec<DensePermutation>),
+    /// Storage does not match the view (non-contiguous strides or wrong
+    /// element count): keep the host strided-gather path.
+    Host,
+}
+
+fn route_permutation(
+    storage_len: usize,
+    shape: &[usize],
+    strides: &[usize],
+    permutation: &[usize],
+) -> Result<PermuteRoute, AscendError> {
+    if let Some(plan) = dense_permutation(storage_len, shape, strides, permutation)? {
+        return Ok(PermuteRoute::Single(plan));
+    }
+    // dense_permutation declines three cases; only rank > 8 is decomposable.
+    if shape.len() <= ACLNN_PERMUTE_MAX_RANK {
+        return Ok(PermuteRoute::Host);
+    }
+    let numel = checked_product(shape, "Ascend permutation size overflow")?;
+    if numel != storage_len {
+        return Ok(PermuteRoute::Host);
+    }
+    let mut physical_axes: Vec<usize> = (0..shape.len()).collect();
+    physical_axes.sort_by_key(|&axis| (strides[axis], axis));
+    let mut expected_stride = 1usize;
+    for &axis in &physical_axes {
+        if strides[axis] != expected_stride {
+            return Ok(PermuteRoute::Host);
+        }
+        expected_stride = expected_stride
+            .checked_mul(shape[axis])
+            .ok_or_else(|| AscendError::status("Ascend permutation stride overflow", -1))?;
+    }
+    // Row-major picture, as in dense_permutation: physical input order and the
+    // requested output order, both in original axis ids.
+    let input_axes: Vec<usize> = physical_axes.into_iter().rev().collect();
+    let output_axes: Vec<usize> = permutation.iter().rev().copied().collect();
+    if input_axes == output_axes {
+        // Identity permutations are handled by callers; keep the host path as
+        // the defensive answer.
+        return Ok(PermuteRoute::Host);
+    }
+    let steps = plan_permutation_steps(shape, &input_axes, &output_axes, ACLNN_PERMUTE_MAX_RANK)
+        .into_iter()
+        .map(|step| DensePermutation {
+            input_shape: step.input_shape,
+            output_shape: step.output_shape,
+            dims: step.dims,
+        })
+        .collect();
+    Ok(PermuteRoute::Steps(steps))
 }
 
 #[cfg(test)]
@@ -291,5 +367,40 @@ mod tests {
         assert!(
             dense_permutation(usize::MAX, &[usize::MAX, 2], &[1, usize::MAX], &[0, 1]).is_err()
         );
+    }
+
+    fn canonical_strides(shape: &[usize]) -> Vec<usize> {
+        let mut strides = Vec::with_capacity(shape.len());
+        let mut stride = 1usize;
+        for &extent in shape {
+            strides.push(stride);
+            stride *= extent;
+        }
+        strides
+    }
+
+    #[test]
+    fn non_contiguous_or_mismatched_high_rank_stays_host() {
+        let shape = [2usize; 9];
+        let strides = canonical_strides(&shape);
+        let permutation: Vec<usize> = (0..9).rev().collect();
+        // wrong element count
+        assert!(matches!(
+            route_permutation(7, &shape, &strides, &permutation).unwrap(),
+            PermuteRoute::Host
+        ));
+        // non-contiguous strides
+        let mut bad_strides = strides.clone();
+        bad_strides[3] = 99;
+        assert!(matches!(
+            route_permutation(512, &shape, &bad_strides, &permutation).unwrap(),
+            PermuteRoute::Host
+        ));
+        // identity stays host (callers handle it upstream)
+        let identity: Vec<usize> = (0..9).collect();
+        assert!(matches!(
+            route_permutation(512, &shape, &strides, &identity).unwrap(),
+            PermuteRoute::Host
+        ));
     }
 }
