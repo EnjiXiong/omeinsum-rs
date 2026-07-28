@@ -807,6 +807,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn complex_merge_naive4m_matches_native_value() {
+        let mut n = test_network(
+            vec![vec![0], vec![0]],
+            vec![vec![3], vec![3]],
+            vec![],
+            HashMap::from([(0, 3)]),
+        );
+        n.tensors[0].data_re = vec![1.0, -2.0, 0.5];
+        n.tensors[0].data_im = vec![0.25, 1.5, -0.75];
+        n.tensors[1].data_re = vec![-0.5, 2.0, 3.0];
+        n.tensors[1].data_im = vec![1.0, -0.25, 0.5];
+        n.tensors
+            .iter_mut()
+            .for_each(|tensor| tensor.structurally_complex = true);
+
+        let expected = solve_native(&n, &native_cache(&n, Cpu, Complex32::new), &Cpu);
+        let actual = solve_naive4m(&n, &real_cache(&n, Cpu), &Cpu);
+
+        assert!(
+            (actual - expected).norm() <= 1e-6,
+            "naive4m={actual:?}, native={expected:?}"
+        );
+    }
+
     fn test_network(
         labels: Vec<Vec<usize>>,
         shapes: Vec<Vec<usize>>,
