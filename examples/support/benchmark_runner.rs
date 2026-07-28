@@ -408,7 +408,17 @@ fn dense_tree_code(
     (einsum, factor_positions, RealifiedOutput::ReImAxis)
 }
 
-fn real_walk<B: Backend + Clone>(node: &TreeNode, leaves: &[RealValue<B>]) -> RealValue<B>
+#[derive(Clone, Copy)]
+enum ComplexMerge {
+    Gauss3m,
+    Naive4m,
+}
+
+fn real_walk<B: Backend + Clone>(
+    node: &TreeNode,
+    leaves: &[RealValue<B>],
+    merge: ComplexMerge,
+) -> RealValue<B>
 where
     f32: BackendScalar<B>,
 {
@@ -419,8 +429,8 @@ where
             input_indices,
             output_indices,
         } => {
-            let (ar, ai) = real_walk(&args[0], leaves);
-            let (br, bi) = real_walk(&args[1], leaves);
+            let (ar, ai) = real_walk(&args[0], leaves, merge);
+            let (br, bi) = real_walk(&args[1], leaves, merge);
             let c = |x: &Tensor<f32, B>, y: &Tensor<f32, B>| {
                 x.contract_binary::<Standard<f32>>(
                     y,
@@ -441,7 +451,7 @@ where
                     let im = c(&ar, &bi);
                     (re, Some(im))
                 }
-                (Some(ai), Some(bi)) => {
+                (Some(ai), Some(bi)) if matches!(merge, ComplexMerge::Gauss3m) => {
                     let asum = ar.linear_combination(&ai, 1.0);
                     let bsum = br.linear_combination(&bi, 1.0);
                     let p1 = c(&asum, &bsum);
@@ -453,15 +463,25 @@ where
                         .linear_combination(&p3, -1.0);
                     (re, Some(im))
                 }
+                (Some(ai), Some(bi)) => {
+                    let rr = c(&ar, &br);
+                    let ii = c(&ai, &bi);
+                    let ri = c(&ar, &bi);
+                    let ir = c(&ai, &br);
+                    let re = rr.linear_combination(&ii, -1.0);
+                    let im = ri.linear_combination(&ir, 1.0);
+                    (re, Some(im))
+                }
             }
         }
     }
 }
 
-pub fn solve_real<B: Backend + Clone>(
+fn solve_real_with_merge<B: Backend + Clone>(
     network: &BenchmarkNetwork,
     cache: &[Vec<RealValue<B>>],
     backend: &B,
+    merge: ComplexMerge,
 ) -> Complex32
 where
     f32: BackendScalar<B>,
@@ -470,7 +490,7 @@ where
         .iter()
         .map(|assignment| {
             let leaves = select_real_leaves(network, cache, assignment);
-            real_walk(&network.contraction_order, &leaves)
+            real_walk(&network.contraction_order, &leaves, merge)
         })
         .collect::<Vec<_>>();
     backend.synchronize();
@@ -488,6 +508,28 @@ where
         }
     }
     Complex32::new(re.sum as f32, im.sum as f32)
+}
+
+pub fn solve_real<B: Backend + Clone>(
+    network: &BenchmarkNetwork,
+    cache: &[Vec<RealValue<B>>],
+    backend: &B,
+) -> Complex32
+where
+    f32: BackendScalar<B>,
+{
+    solve_real_with_merge(network, cache, backend, ComplexMerge::Gauss3m)
+}
+
+pub fn solve_naive4m<B: Backend + Clone>(
+    network: &BenchmarkNetwork,
+    cache: &[Vec<RealValue<B>>],
+    backend: &B,
+) -> Complex32
+where
+    f32: BackendScalar<B>,
+{
+    solve_real_with_merge(network, cache, backend, ComplexMerge::Naive4m)
 }
 
 pub fn native_cache<T, B: Backend + Clone, F: Fn(f32, f32) -> T>(
