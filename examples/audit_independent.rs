@@ -7,9 +7,9 @@
 //!
 //!   * tree-free cascade (`realify_code`): the canonical realified einsum;
 //!     the optimizer has never seen its structure.
-//!   * tree-following (`realify_tree_code` on the archived tree): merges
-//!     expanded into Gauss-3M factor leaves where the archived tree merges
-//!     complex subtrees. Its installed tree is evaluated as the
+//!   * tree-following (`realify_tree_code` on the selected unsliced complex
+//!     tree): merges expanded into Gauss-3M factor leaves where that tree
+//!     merges complex subtrees. Its installed tree is evaluated as the
 //!     same-structure reference; its flat code is then re-optimized as a
 //!     second independent run.
 //!
@@ -108,33 +108,46 @@ fn deviation_pct(independent: f64, same_tree: f64) -> f64 {
 
 fn run(network: &BenchmarkNetwork, optimizer: &TreeSA) -> serde_json::Value {
     network.validate().expect("artifact is invalid");
-    assert!(
-        network.cuts.is_empty(),
-        "W6 audits the unsliced plan; sliced artifacts are out of scope"
-    );
     let ixs = &network.eincode.input_indices;
     let iy = &network.eincode.output_indices;
     let sizes = &network.size_dict;
     let is_complex: Vec<bool> = network.tensors.iter().map(|t| t.structurally_complex).collect();
     let complex_leaves = is_complex.iter().filter(|&&c| c).count();
 
-    // Complex side, recomputed from the archived tree (self-contained: the
-    // stored physical_unsliced block is cross-checked, not trusted).
-    let tree = network.contraction_order.to_nested();
+    // Unsliced complex sibling. An unsliced artifact already archives this
+    // tree. A sliced artifact only archives the post-slicing tree, so recover
+    // the missing unsliced sibling with the same deterministic TreeSA policy
+    // used for both independent realified optimizations below.
+    let (tree, complex_tree_source) = if network.cuts.is_empty() {
+        (
+            network.contraction_order.to_nested(),
+            "archived_unsliced",
+        )
+    } else {
+        let code = omeco::EinCode::new(ixs.clone(), iy.clone());
+        (
+            optimize_code(&code, sizes, optimizer)
+                .expect("TreeSA produced no unsliced complex sibling"),
+            "reoptimized_unsliced_from_sliced_artifact",
+        )
+    };
     let complex = metric(contraction_complexity(&tree, sizes, ixs));
     let stored = &network.complexity.physical_unsliced;
-    for (recomputed, stored) in [
-        (complex.log2_flops, stored.log2_flops),
-        (complex.log2_peak_elements, stored.log2_peak_elements),
-        (complex.log2_readwrites, stored.log2_readwrites),
-    ] {
-        assert!(
-            (recomputed - stored).abs() < 1e-9,
-            "artifact complexity block disagrees with its archived tree"
-        );
+    if network.cuts.is_empty() {
+        for (recomputed, stored) in [
+            (complex.log2_flops, stored.log2_flops),
+            (complex.log2_peak_elements, stored.log2_peak_elements),
+            (complex.log2_readwrites, stored.log2_readwrites),
+        ] {
+            assert!(
+                (recomputed - stored).abs() < 1e-9,
+                "artifact complexity block disagrees with its archived tree"
+            );
+        }
     }
 
-    // Same-tree realified values: the law applied to the archived tree.
+    // Same-tree realified values: the law applied to the selected unsliced
+    // complex tree.
     let audit = audit_tree(
         &network.contraction_order,
         &is_complex,
@@ -194,9 +207,20 @@ fn run(network: &BenchmarkNetwork, optimizer: &TreeSA) -> serde_json::Value {
             "cuts": network.cuts.len(),
         },
         "complex_tree": {
+            "source": complex_tree_source,
             "tc": complex.log2_flops,
             "sc": complex.log2_peak_elements,
             "rwc": complex.log2_readwrites,
+            "stored_physical_unsliced": {
+                "tc": stored.log2_flops,
+                "sc": stored.log2_peak_elements,
+                "rwc": stored.log2_readwrites,
+            },
+            "delta_vs_stored": {
+                "dtc": complex.log2_flops - stored.log2_flops,
+                "dsc": complex.log2_peak_elements - stored.log2_peak_elements,
+                "drwc": complex.log2_readwrites - stored.log2_readwrites,
+            },
         },
         "same_tree_real": {
             "m": audit.m,
@@ -224,7 +248,7 @@ fn run(network: &BenchmarkNetwork, optimizer: &TreeSA) -> serde_json::Value {
                 "tc": follow_installed.log2_flops,
                 "sc": follow_installed.log2_peak_elements,
                 "rwc": follow_installed.log2_readwrites,
-                "note": "same-structure reference: archived tree with Gauss-3M merge factorization",
+                "note": "same-structure reference: selected unsliced complex tree with Gauss-3M merge factorization",
             },
             "optimized": {
                 "tc": follow_opt.log2_flops,
@@ -417,5 +441,20 @@ mod tests {
         // The output gained exactly one size-2 Re/Im axis.
         let d = &report["deltas_vs_same_tree"];
         assert!(d["tree_free"]["tc_deviation_pct"].as_f64().unwrap().is_finite());
+    }
+
+    #[test]
+    fn sliced_artifact_reoptimizes_the_unsliced_complex_sibling() {
+        let mut network = tiny(true);
+        network.cuts = vec![1];
+        network.assignment_count = 3;
+
+        let report = run(&network, &policy());
+
+        assert_eq!(
+            report["complex_tree"]["source"],
+            "reoptimized_unsliced_from_sliced_artifact"
+        );
+        assert_eq!(report["network"]["cuts"], 1);
     }
 }
