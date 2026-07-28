@@ -704,6 +704,7 @@ mod tests {
             format: "omeinsum-yao-benchmark-v2".into(),
             source_format: "x".into(),
             source_mode: "x".into(),
+            dtype: "f32".into(),
             optimizer: Default::default(),
             slicer: Default::default(),
             eincode: super::super::format::BenchmarkEinCode {
@@ -715,12 +716,16 @@ mod tests {
                     shape: vec![2],
                     data_re: vec![1., 2.],
                     data_im: vec![0., 0.],
+                    data_re_f64: None,
+                    data_im_f64: None,
                     structurally_complex: false,
                 },
                 super::super::format::BenchmarkTensor {
                     shape: vec![2],
                     data_re: vec![3., 4.],
                     data_im: vec![1., -1.],
+                    data_re_f64: None,
+                    data_im_f64: None,
                     structurally_complex: true,
                 },
             ],
@@ -846,6 +851,8 @@ mod tests {
                     shape: shape.clone(),
                     data_re: vec![1.0; len],
                     data_im: vec![0.0; len],
+                    data_re_f64: None,
+                    data_im_f64: None,
                     structurally_complex: false,
                 }
             })
@@ -866,6 +873,7 @@ mod tests {
             format: "omeinsum-yao-benchmark-v2".into(),
             source_format: "x".into(),
             source_mode: "x".into(),
+            dtype: "f32".into(),
             optimizer: Default::default(),
             slicer: Default::default(),
             eincode: super::super::format::BenchmarkEinCode {
