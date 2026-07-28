@@ -6,7 +6,9 @@ mod format;
 #[path = "support/benchmark_runner.rs"]
 mod runner;
 use format::BenchmarkNetwork;
-use num_complex::{Complex32, Complex64};
+use num_complex::Complex32;
+#[cfg(not(feature = "ascend"))]
+use num_complex::Complex64;
 #[cfg(all(feature = "cuda", not(feature = "ascend")))]
 use omeinsum::backend::CudaComplex;
 #[cfg(all(feature = "ascend", not(feature = "cuda")))]
@@ -16,7 +18,11 @@ use omeinsum::Cpu as Device;
 #[cfg(all(feature = "cuda", not(feature = "ascend")))]
 use omeinsum::Cuda as Device;
 use omeinsum::{Backend, Cpu};
-use std::{fs::File, io::BufReader, time::Instant};
+use std::{
+    fs::File,
+    io::BufReader,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 struct Args {
     path: String,
@@ -69,6 +75,13 @@ fn cpu_reference(n: &BenchmarkNetwork) -> Complex32 {
     runner::solve_native(&unsliced, &c, &Cpu)
 }
 
+fn epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock predates Unix epoch")
+        .as_millis()
+}
+
 fn main() {
     let a = args();
     let mut d = serde_json::Deserializer::from_reader(BufReader::new(File::open(&a.path).unwrap()));
@@ -90,6 +103,13 @@ fn main() {
             let run_device = dev.clone();
             Box::new(move || runner::solve_real(&run_network, &cache, &run_device))
         }
+        "naive4m" => {
+            let cache = runner::real_cache(&n, dev.clone());
+            dev.synchronize();
+            let run_network = n.clone();
+            let run_device = dev.clone();
+            Box::new(move || runner::solve_naive4m(&run_network, &cache, &run_device))
+        }
         "static-factorized" => {
             let prepared = runner::static_factorized(&n, dev.clone());
             dev.synchronize();
@@ -106,7 +126,7 @@ fn main() {
         }
         "native-complex" => native_run(&n, &dev),
         _ => panic!(
-            "representation must be native-complex, tree-real/dispatch, static-factorized, or static-dense"
+            "representation must be native-complex, tree-real/dispatch, naive4m, static-factorized, or static-dense"
         ),
     };
     let initial = run();
@@ -122,11 +142,13 @@ fn main() {
         std::hint::black_box(run());
     }
     let mut samples = Vec::new();
+    let timed_start_epoch_ms = epoch_millis();
     for _ in 0..a.repeats {
         let t = Instant::now();
         std::hint::black_box(run());
         samples.push(t.elapsed().as_secs_f64() * 1e3);
     }
+    let timed_end_epoch_ms = epoch_millis();
     let mut sorted = samples.clone();
     sorted.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
@@ -155,6 +177,9 @@ fn main() {
             .map(|x| format!("{x:.6}"))
             .collect::<Vec<_>>()
             .join(",")
+    );
+    println!(
+        "timed_window_epoch_ms start={timed_start_epoch_ms} end={timed_end_epoch_ms}"
     );
 }
 
@@ -202,11 +227,13 @@ fn run_c64(a: &Args, n: &BenchmarkNetwork, dev: &Device) {
         std::hint::black_box(run());
     }
     let mut samples = Vec::new();
+    let timed_start_epoch_ms = epoch_millis();
     for _ in 0..a.repeats {
         let t = Instant::now();
         std::hint::black_box(run());
         samples.push(t.elapsed().as_secs_f64() * 1e3);
     }
+    let timed_end_epoch_ms = epoch_millis();
     let mut sorted = samples.clone();
     sorted.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
@@ -235,6 +262,9 @@ fn run_c64(a: &Args, n: &BenchmarkNetwork, dev: &Device) {
             .map(|x| format!("{x:.6}"))
             .collect::<Vec<_>>()
             .join(",")
+    );
+    println!(
+        "timed_window_epoch_ms start={timed_start_epoch_ms} end={timed_end_epoch_ms}"
     );
 }
 
