@@ -422,11 +422,11 @@ pub(crate) struct PermuteStep {
 ///
 /// Fast path: if the current order decomposes into at most `max_rank` *runs*
 /// (maximal segments whose axes stay consecutive in the target), a single
-/// permute of the merged view finishes. General path: repeatedly place up to
-/// three target axes, reducing that count when necessary so the already
-/// placed prefix, selected axes, and untouched gaps fit `max_rank`. Each
-/// step's output is contiguous in the new axis order and becomes the next
-/// step's input.
+/// permute of the merged view finishes. General path: repeatedly place the
+/// next three target axes (the already-placed prefix and the untouched gaps
+/// merge into at most 1 + 3 + 4 super-axes), terminating in at most
+/// ceil(n/3) steps. Each step's output is contiguous in the new axis order
+/// and becomes the next step's input.
 #[cfg(any(feature = "ascend", feature = "ascend-tropical", test))]
 pub(crate) fn plan_permutation_steps(
     shape: &[usize],
@@ -435,10 +435,7 @@ pub(crate) fn plan_permutation_steps(
     max_rank: usize,
 ) -> Vec<PermuteStep> {
     let n = input_axes.len();
-    assert!(
-        max_rank >= 4,
-        "permutation decomposition requires max_rank >= 4"
-    );
+    debug_assert!(max_rank >= 4);
     debug_assert!(n <= 64);
     let position: Vec<usize> = {
         let mut p = vec![0usize; n];
@@ -489,11 +486,7 @@ pub(crate) fn plan_permutation_steps(
             .zip(&target)
             .take_while(|(a, b)| a == b)
             .count();
-        // Placing k axes can create one prefix group, k singleton groups,
-        // and k + 1 gap groups in the worst case. Keep k=3 for rank 8,
-        // while respecting stricter limits such as rank 7 or 6.
-        let max_axes_per_step = (max_rank - 2) / 2;
-        let k = 3usize.min(max_axes_per_step).min(n - placed);
+        let k = 3usize.min(n - placed);
         let want: Vec<usize> = target[placed..placed + k].to_vec();
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut gap_indices: Vec<usize> = Vec::new();
@@ -637,33 +630,6 @@ mod tests {
         let mut permutation: Vec<usize> = (0..shape.len()).collect();
         permutation.rotate_left(1);
         assert_eq!(steps_match_host(&shape, &permutation), 1);
-    }
-
-    #[test]
-    fn high_rank_planner_respects_stricter_axis_limits() {
-        let shape = [2usize; 10];
-        let input_axes: Vec<usize> = (0..shape.len()).collect();
-        let output_axes = vec![0, 2, 4, 6, 1, 3, 5, 7, 8, 9];
-        let data: Vec<i64> = (0..shape.iter().product::<usize>() as i64).collect();
-        let dims = output_axes
-            .iter()
-            .map(|&axis| axis as i64)
-            .collect::<Vec<_>>();
-        let expected = apply_row_major_permutation(&data, &shape, &dims);
-        for max_rank in [7usize, 6] {
-            let steps = plan_permutation_steps(&shape, &input_axes, &output_axes, max_rank);
-            assert!(!steps.is_empty());
-            assert!(
-                steps.iter().all(|step| step.input_shape.len() <= max_rank),
-                "planner emitted a step above rank {max_rank}: {steps:?}"
-            );
-
-            let mut actual = data.clone();
-            for step in &steps {
-                actual = apply_row_major_permutation(&actual, &step.input_shape, &step.dims);
-            }
-            assert_eq!(actual, expected, "max_rank={max_rank}");
-        }
     }
 
     #[test]

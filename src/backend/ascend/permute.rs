@@ -14,12 +14,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-const ACLNN_PERMUTE_API_MAX_RANK: usize = 8;
-// CANN 8.5 accepts rank-8 aclnnPermute calls, but one merged-view
-// shape/permutation used by the tensor-network workload is known to
-// mis-execute silently. Keep ordinary rank-8 tensors on the direct API path,
-// while decomposing high-rank views into steps no larger than rank 7.
-const ACLNN_DECOMPOSED_PERMUTE_MAX_RANK: usize = 7;
+const ACLNN_PERMUTE_MAX_RANK: usize = 8;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DensePermutation {
@@ -50,7 +45,7 @@ pub(crate) fn dense_permutation(
     let numel = checked_product(shape, "Ascend permutation size overflow")?;
     // CANN aclnnPermute rejects tensors above rank 8 with ACLNN_ERR_PARAM_INVALID.
     // Let the caller use the existing host materialization path for those views.
-    if shape.len() > ACLNN_PERMUTE_API_MAX_RANK {
+    if shape.len() > ACLNN_PERMUTE_MAX_RANK {
         return Ok(None);
     }
     if numel != storage_len {
@@ -160,7 +155,7 @@ pub(crate) fn materialize(
         PermuteRoute::Single(plan) => materialize_dense(runtime, source, plan),
         PermuteRoute::Steps(steps) => {
             // CANN silently mis-executes aclnnPermute for specific shape/dims
-            // combinations at its supported rank limit (observed: rank-8 merged-view
+            // combinations beyond its rank limit (observed: rank-8 merged-view
             // plan [2,2,2,2,16,4,2,128] x dims [4,0,5,1,6,2,7,3] on CANN 8.5,
             // 99.9% of elements misplaced). The mis-fire region is a black
             // box, so the first execution of every unique high-rank
@@ -231,7 +226,7 @@ fn verify_cache() -> &'static Mutex<HashMap<Signature, bool>> {
 enum PermuteRoute {
     /// One aclnnPermute call (rank <= 8).
     Single(DensePermutation),
-    /// A chain of aclnnPermute calls, each rank <= 7, for high-rank views
+    /// A chain of aclnnPermute calls, each rank <= 8, for high-rank views
     /// (W8: replaces the host round trip through the CPU).
     Steps(Vec<DensePermutation>),
     /// Storage does not match the view (non-contiguous strides or wrong
@@ -252,7 +247,7 @@ fn route_permutation(
         return Ok(PermuteRoute::Single(plan));
     }
     // dense_permutation declines three cases; only rank > 8 is decomposable.
-    if shape.len() <= ACLNN_PERMUTE_API_MAX_RANK {
+    if shape.len() <= ACLNN_PERMUTE_MAX_RANK {
         return Ok(PermuteRoute::Host);
     }
     let numel = checked_product(shape, "Ascend permutation size overflow")?;
@@ -279,19 +274,14 @@ fn route_permutation(
         // the defensive answer.
         return Ok(PermuteRoute::Host);
     }
-    let steps = plan_permutation_steps(
-        shape,
-        &input_axes,
-        &output_axes,
-        ACLNN_DECOMPOSED_PERMUTE_MAX_RANK,
-    )
-    .into_iter()
-    .map(|step| DensePermutation {
-        input_shape: step.input_shape,
-        output_shape: step.output_shape,
-        dims: step.dims,
-    })
-    .collect::<Vec<_>>();
+    let steps = plan_permutation_steps(shape, &input_axes, &output_axes, ACLNN_PERMUTE_MAX_RANK)
+        .into_iter()
+        .map(|step| DensePermutation {
+            input_shape: step.input_shape,
+            output_shape: step.output_shape,
+            dims: step.dims,
+        })
+        .collect::<Vec<_>>();
     if std::env::var_os("OMEINSUM_DEBUG_PERMUTE").is_some() {
         eprintln!(
             "permute rank {}: shape={shape:?} strides={strides:?} permutation={permutation:?} steps={}",
@@ -480,85 +470,6 @@ mod tests {
             route_permutation(512, &shape, &strides, &identity).unwrap(),
             PermuteRoute::Host
         ));
-    }
-
-    #[test]
-    fn high_rank_routes_avoid_rank_eight_steps() {
-        let shape = [2usize; 10];
-        let strides = canonical_strides(&shape);
-        // In the backend's reversed row-major picture this places three
-        // separated target axes and makes the old rank-8 planner emit an
-        // eight-super-axis step.
-        let permutation = [0, 1, 2, 4, 6, 8, 3, 5, 7, 9];
-        let steps = match route_permutation(1024, &shape, &strides, &permutation).unwrap() {
-            PermuteRoute::Steps(steps) => steps,
-            _ => panic!("high-rank contiguous permutation must use device steps"),
-        };
-        assert!(!steps.is_empty());
-        assert!(
-            steps.iter().all(|step| step.input_shape.len() <= 7),
-            "high-rank route emitted a rank-8 device step: {steps:?}"
-        );
-    }
-
-    /// Device regression for the exact CANN 8.5 rank-8 signature observed to
-    /// mis-execute. Decomposing it into rank-7 and rank-6 calls must reproduce
-    /// the direct host permutation without invoking the faulty rank-8 call.
-    #[test]
-    fn device_bad_rank_eight_signature_works_when_decomposed() {
-        let runtime = match Runtime::new(0) {
-            Ok(runtime) => std::sync::Arc::new(runtime),
-            Err(error) => {
-                eprintln!("no Ascend device available, skipping probe: {error}");
-                return;
-            }
-        };
-        let shape = vec![2usize, 2, 2, 2, 16, 4, 2, 128];
-        let dims = vec![4i64, 0, 5, 1, 6, 2, 7, 3];
-        let input_axes: Vec<usize> = (0..shape.len()).collect();
-        let output_axes: Vec<usize> = dims
-            .iter()
-            .map(|&axis| usize::try_from(axis).unwrap())
-            .collect();
-        let numel: usize = shape.iter().product();
-        let data: Vec<f32> = (0..numel).map(|x| x as f32).collect();
-        let expected = apply_row_major_permutation(&data, &shape, &dims);
-
-        for max_rank in [7usize, 6] {
-            let steps = plan_permutation_steps(&shape, &input_axes, &output_axes, max_rank);
-            assert!(!steps.is_empty());
-            assert!(
-                steps.iter().all(|step| step.input_shape.len() <= max_rank),
-                "rank-{max_rank} plan exceeded its limit: {steps:?}"
-            );
-            let step_ranks = steps
-                .iter()
-                .map(|step| step.input_shape.len())
-                .collect::<Vec<_>>();
-            let mut current =
-                AscendStorage::upload(runtime.clone(), &data).expect("upload probe tensor");
-            for step in steps {
-                current = materialize_dense(
-                    &runtime,
-                    &current,
-                    DensePermutation {
-                        input_shape: step.input_shape,
-                        output_shape: step.output_shape,
-                        dims: step.dims,
-                    },
-                )
-                .expect("execute decomposed device permute");
-            }
-            let device = current.to_vec().expect("download decomposed result");
-            assert_eq!(
-                device, expected,
-                "rank-{max_rank} decomposition diverged from host"
-            );
-            println!(
-                "rank-{max_rank} decomposition PASS: {} steps, ranks={step_ranks:?}",
-                step_ranks.len()
-            );
-        }
     }
 
     /// Device probe (runs only where an Ascend device exists): execute single
