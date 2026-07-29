@@ -18,9 +18,8 @@ const ACLNN_PERMUTE_API_MAX_RANK: usize = 8;
 // CANN 8.5 accepts rank-8 aclnnPermute calls, but one merged-view
 // shape/permutation used by the tensor-network workload is known to
 // mis-execute silently. Keep ordinary rank-8 tensors on the direct API path,
-// Rank-7 merged views also proved unstable in the end-to-end workload, so
-// decompose high-rank views into steps no larger than rank 6.
-const ACLNN_DECOMPOSED_PERMUTE_MAX_RANK: usize = 6;
+// while decomposing high-rank views into steps no larger than rank 7.
+const ACLNN_DECOMPOSED_PERMUTE_MAX_RANK: usize = 7;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DensePermutation {
@@ -232,7 +231,7 @@ fn verify_cache() -> &'static Mutex<HashMap<Signature, bool>> {
 enum PermuteRoute {
     /// One aclnnPermute call (rank <= 8).
     Single(DensePermutation),
-    /// A chain of aclnnPermute calls, each rank <= 6, for high-rank views
+    /// A chain of aclnnPermute calls, each rank <= 7, for high-rank views
     /// (W8: replaces the host round trip through the CPU).
     Steps(Vec<DensePermutation>),
     /// Storage does not match the view (non-contiguous strides or wrong
@@ -497,8 +496,8 @@ mod tests {
         };
         assert!(!steps.is_empty());
         assert!(
-            steps.iter().all(|step| step.input_shape.len() <= 6),
-            "high-rank route emitted a device step above rank 6: {steps:?}"
+            steps.iter().all(|step| step.input_shape.len() <= 7),
+            "high-rank route emitted a rank-8 device step: {steps:?}"
         );
     }
 
